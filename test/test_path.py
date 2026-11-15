@@ -2149,5 +2149,295 @@ class TestPathBugs(unittest.TestCase):
         self.assertEqual(len(p1.intersect(p2)), len(p2.intersect(p1)))
 
 
+def _expected_on_length(length, pattern, offset=0.0):
+    """Independent brute-force computation of the painted arc length of an
+    open subpath of the given length, following the SVG dash rules."""
+    pattern = list(pattern)
+    if len(pattern) % 2 == 1:
+        # Odd-length patterns repeat to even length per the SVG spec.
+        pattern = pattern + pattern
+    period = float(sum(pattern))
+    phase = (-offset) % period
+    pos = 0.0
+    painted = 0.0
+    slot_index = 0
+    while pos < length:
+        slot = float(pattern[slot_index % len(pattern)])
+        slot_index += 1
+        if phase > 0:
+            if phase >= slot:
+                phase -= slot
+                continue
+            consumed = slot - phase
+            phase = 0.0
+        else:
+            consumed = slot
+        end = min(pos + consumed, length)
+        if (slot_index - 1) % 2 == 0:
+            painted += end - pos
+        pos = end
+    return painted
+
+
+def _mixed_open_path():
+    """A continuous path mixing a Line, CubicBezier, QuadraticBezier and
+    Arc segment."""
+    return Path(
+        Line(0, 10),
+        CubicBezier(10, 10 + 10j, 30 + 10j, 30),
+        QuadraticBezier(30, 40 - 10j, 50),
+        Arc(50, radius=10 + 5j, rotation=30, large_arc=False, sweep=True,
+            end=60))
+
+
+def _mixed_closed_path():
+    """A closed continuous path mixing all four segment types."""
+    return Path(
+        Line(0, 10),
+        CubicBezier(10, 10 + 10j, 30 + 10j, 30),
+        Arc(30, radius=10 + 5j, rotation=20, large_arc=False, sweep=True,
+            end=20 - 10j),
+        QuadraticBezier(20 - 10j, 5j, 0))
+
+
+class TestDashed(unittest.TestCase):
+    """Tests for Path.dashed() (SVG stroke-dasharray / stroke-dashoffset)."""
+
+    def test_solid_when_dashing_disabled(self):
+        p = _mixed_open_path()
+        # None, 'none' and the empty string all mean "no dasharray" and must
+        # hand back the unchanged continuous subpaths.
+        self.assertEqual(p.dashed(None), p.continuous_subpaths())
+        self.assertEqual(p.dashed('none'), p.continuous_subpaths())
+        self.assertEqual(p.dashed(''), p.continuous_subpaths())
+        self.assertEqual(p.dashed(()), p.continuous_subpaths())
+
+    def test_illegal_dasharray_is_solid(self):
+        # Negative or non-finite entries make the attribute illegal per the
+        # SVG spec, which disables dashing (solid rendering).
+        p = _mixed_open_path()
+        solid = p.continuous_subpaths()
+        self.assertEqual(p.dashed((-1.0, 2.0)), solid)
+        self.assertEqual(p.dashed((1.0, float('nan'))), solid)
+        self.assertEqual(p.dashed((float('inf'), 1.0)), solid)
+        self.assertEqual(p.dashed('-1,2'), solid)
+        self.assertEqual(p.dashed('garbage'), solid)
+
+    def test_all_zero_pattern_paints_nothing(self):
+        p = _mixed_open_path()
+        self.assertEqual(p.dashed((0, 0)), [])
+        self.assertEqual(p.dashed((0, 0, 0, 0), dashoffset=5.0), [])
+        self.assertEqual(Path().dashed((1, 2)), [])
+        self.assertEqual(Path(Line(0, 0)).dashed((1, 1)), [])
+
+    def test_non_finite_offset_treated_as_zero(self):
+        p = _mixed_open_path()
+        baseline = p.dashed((4, 4), 0.0)
+        for bad in (float('nan'), float('inf'), float('-inf')):
+            got = p.dashed((4, 4), bad)
+            self.assertEqual(len(got), len(baseline))
+            for a, b in zip(got, baseline):
+                self.assertAlmostEqual(a.length(), b.length(), places=10)
+
+    def test_bad_argument_types(self):
+        p = _mixed_open_path()
+        with self.assertRaises(TypeError):
+            p.dashed(123)
+        with self.assertRaises(TypeError):
+            p.dashed((1, 2), dashoffset='x')
+
+    def test_odd_pattern_is_repeated(self):
+        # An odd number of entries is repeated: (3,) behaves like (3, 3).
+        p = _mixed_open_path()
+        odd = p.dashed((3,))
+        even = p.dashed((3, 3))
+        self.assertEqual(len(odd), len(even))
+        for a, b in zip(odd, even):
+            self.assertAlmostEqual(a.length(), b.length(), places=10)
+
+    def test_string_dasharray_forms(self):
+        p = _mixed_open_path()
+        tuple_form = p.dashed((4, 4))
+        for text in ('4,4', '4 4', ' 4 , 4 '):
+            got = p.dashed(text)
+            self.assertEqual(len(got), len(tuple_form))
+            for a, b in zip(got, tuple_form):
+                self.assertAlmostEqual(a.length(), b.length(), places=10)
+
+    def test_visible_length_open_mixed_path(self):
+        # Arc length must accumulate continuously across Line / Bezier /
+        # Arc boundaries; total painted length matches a brute-force model.
+        p = _mixed_open_path()
+        length = p.length()
+        for pattern in [(4, 4), (3,), (6, 2, 1, 2), (2.5, 0.75)]:
+            for offset in (0.0, 1.0, 3.9, -1.0, -4.0, 17.7):
+                pieces = p.dashed(pattern, offset)
+                expected = _expected_on_length(length, pattern, offset)
+                got = sum(piece.length() for piece in pieces)
+                self.assertAlmostEqual(got, expected, places=8,
+                                       msg=(pattern, offset))
+                # Every returned run must be internally continuous.
+                for piece in pieces:
+                    self.assertTrue(piece.iscontinuous())
+
+    def test_line_endpoints_exact(self):
+        line = Path(Line(0, 10))
+        pieces = line.dashed((3, 2))
+        expected = [(0, 3), (5, 8)]
+        self.assertEqual(len(pieces), 2)
+        for piece, (a, b) in zip(pieces, expected):
+            self.assertAlmostEqual(abs(piece.start - complex(a)), 0.0)
+            self.assertAlmostEqual(abs(piece.end - complex(b)), 0.0)
+            self.assertAlmostEqual(piece.length(), b - a)
+
+    def test_positive_and_negative_offsets_on_line(self):
+        line = Path(Line(0, 10))
+        # offset +1 -> first on slot [1, 4]
+        plus = line.dashed((3, 2), 1)
+        self.assertAlmostEqual(abs(plus[0].start - 1), 0.0)
+        self.assertAlmostEqual(abs(plus[0].end - 4), 0.0)
+        # offset -1 shifts the whole pattern forward: [0,2],[4,7],[9,10]
+        minus = line.dashed((3, 2), -1)
+        expected = [(0, 2), (4, 7), (9, 10)]
+        self.assertEqual(len(minus), 3)
+        for piece, (a, b) in zip(minus, expected):
+            self.assertAlmostEqual(abs(piece.start - a), 0.0)
+            self.assertAlmostEqual(abs(piece.end - b), 0.0)
+        # A whole-period offset is the identity.
+        shifted = line.dashed((3, 2), 5.0)
+        unshifted = line.dashed((3, 2), 0.0)
+        self.assertEqual(len(shifted), len(unshifted))
+        for a, b in zip(shifted, unshifted):
+            self.assertAlmostEqual(a.length(), b.length())
+
+    def test_closed_path_visible_length_and_seam_continuity(self):
+        p = _mixed_closed_path()
+        self.assertTrue(p.isclosedac())
+        length = p.length()
+        for offset in (0.0, 2.5, -3.1, 40.0, -55.5):
+            pieces = p.dashed((5, 3), offset)
+            expected = _expected_on_length(length, (5, 3), offset)
+            got = sum(piece.length() for piece in pieces)
+            self.assertAlmostEqual(got, expected, places=8, msg=offset)
+            for piece in pieces:
+                self.assertTrue(piece.iscontinuous(), msg=offset)
+
+    def test_closed_path_seam_wrap_is_one_continuous_piece(self):
+        p = _mixed_closed_path()
+        length = p.length()
+        # An on slot longer than the whole subpath: one run wrapping the seam.
+        pieces = p.dashed((length * 1.5, 2.0))
+        self.assertEqual(len(pieces), 1)
+        wrapped = pieces[0]
+        self.assertTrue(wrapped.iscontinuous())
+        self.assertAlmostEqual(wrapped.length(), length, places=8)
+        # An interior gap leaves a single on-run crossing the seam.
+        pieces = p.dashed((length - 2, 4.0))
+        self.assertEqual(len(pieces), 1)
+        self.assertTrue(pieces[0].iscontinuous())
+        self.assertAlmostEqual(pieces[0].length(), length - 2.0, places=8)
+
+    def test_multiple_subpaths_restart_pattern(self):
+        # Two discontinuous components of lengths 20 (0..20) and 30
+        # (100..130).
+        p = Path(Line(0, 10), Line(10, 20), Line(100, 110), Line(110, 130))
+        sub0, sub1 = p.continuous_subpaths()
+
+        def belongs(piece, sub):
+            lo = min(sub.start.real, sub.end.real)
+            hi = max(sub.start.real, sub.end.real)
+            return all(lo - 1e-9 <= seg.start.real <= hi + 1e-9 and
+                       lo - 1e-9 <= seg.end.real <= hi + 1e-9
+                       for seg in piece)
+
+        pieces = p.dashed((5, 5))
+        first = [q for q in pieces if belongs(q, sub0)]
+        second = [q for q in pieces if belongs(q, sub1)]
+        # Each component restarts the (5,5) pattern independently:
+        # length 20 -> on slots [0,5],[10,15] = 10;
+        # length 30 -> on slots [0,5],[10,15],[20,25] = 15.
+        self.assertAlmostEqual(sum(q.length() for q in first), 10.0)
+        self.assertAlmostEqual(sum(q.length() for q in second), 15.0)
+
+    def test_dash_boundary_inside_curved_segments(self):
+        # Randomized patterns force split points inside Bezier/Arc segments.
+        rng = np.random.default_rng(0)
+        p = _mixed_open_path()
+        length = p.length()
+        for _ in range(40):
+            pattern = tuple(float(rng.uniform(0.5, 5)) for _ in range(4))
+            offset = float(rng.uniform(-10, 10))
+            pieces = p.dashed(pattern, offset)
+            expected = _expected_on_length(length, pattern, offset)
+            got = sum(piece.length() for piece in pieces)
+            self.assertAlmostEqual(got, expected, places=8)
+            for piece in pieces:
+                self.assertTrue(piece.iscontinuous())
+                self.assertGreater(piece.length(), 0.0)
+
+    def test_zero_length_segments_do_not_break_dashing(self):
+        # A zero-length Line inside an otherwise valid path must not reach
+        # inverse arc length with a non-positive length.
+        p = Path(Line(0, 0), Line(0, 10),
+                 CubicBezier(10, 11, 12, 13))
+        pieces = p.dashed((3, 2))
+        expected = _expected_on_length(p.length(), (3, 2), 0.0)
+        self.assertAlmostEqual(sum(q.length() for q in pieces), expected,
+                               places=8)
+
+    def test_zero_slots_do_not_loop(self):
+        p = _mixed_open_path()
+        length = p.length()
+        # Zero gap slots: the whole path is painted, without an infinite loop.
+        self.assertAlmostEqual(
+            sum(q.length() for q in p.dashed((2, 0))), length, places=8)
+        # Zero on slots: nothing is painted.
+        self.assertEqual(p.dashed((0, 2)), [])
+
+    def test_large_offsets_terminate(self):
+        p = _mixed_open_path()
+        # The phase is reduced modulo the pattern period, so a huge offset is
+        # constant-time: the piece count depends only on path length, not on
+        # the offset magnitude (this test would hang if the loop instead
+        # advanced one slot at a time from the raw offset).
+        pieces_pos = p.dashed((1, 1), dashoffset=1e15)
+        pieces_neg = p.dashed((1, 1), dashoffset=-1e15)
+        self.assertGreater(len(pieces_pos), 0)
+        self.assertGreater(len(pieces_neg), 0)
+        # Very short segment with relatively tiny slots: the loop makes
+        # strictly monotone arc-length progress, so it always terminates and
+        # only positive-length pieces are ever emitted.
+        short = Path(Line(0, 1e-6))
+        tiny = short.dashed((1e-11, 1e-11))
+        self.assertTrue(all(piece.length() > 0 for piece in tiny))
+        # The number of painted intervals is bounded by length / min slot.
+        bound = int(short.length() / 1e-11) + 1
+        self.assertLessEqual(len(tiny), bound)
+
+    def test_source_path_not_mutated_and_serialization_unchanged(self):
+        p = _mixed_open_path()
+        before = list(p)
+        d_before = p.d()
+        _ = p.dashed((2, 3), -5)
+        self.assertEqual(list(p), before)
+        self.assertEqual(p.d(), d_before)
+        # The dashed pieces themselves serialize without error.
+        for piece in p.dashed((4, 4)):
+            self.assertIsInstance(piece.d(), str)
+
+    def test_parsed_svg_path_with_arc_and_close(self):
+        d = ("M 10 80 C 40 10, 65 10, 95 80 S 150 150, 180 80 "
+             "A 20 20 0 0 1 200 60 L 210 70 Z")
+        p = parse_path(d)
+        self.assertTrue(p.iscontinuous())
+        self.assertTrue(p.isclosedac())
+        pieces = p.dashed('7 3', dashoffset=-2.5)
+        expected = _expected_on_length(p.length(), (7, 3), -2.5)
+        self.assertAlmostEqual(sum(q.length() for q in pieces), expected,
+                               places=8)
+        for piece in pieces:
+            self.assertTrue(piece.iscontinuous())
+
+
 if __name__ == '__main__':
     unittest.main()

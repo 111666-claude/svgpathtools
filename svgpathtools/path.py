@@ -4,6 +4,7 @@ Arc."""
 
 # External dependencies
 from __future__ import annotations
+import math
 import re
 try:
     from collections.abc import MutableSequence  # noqa
@@ -2493,6 +2494,178 @@ class Arc(object):
             current_t = next_t
 
 
+# Stroke dashing (SVG stroke-dasharray / stroke-dashoffset) ##################
+
+
+def _parse_dasharray(dasharray):
+    """Normalize an SVG ``stroke-dasharray`` value into a tuple of finite,
+    non-negative floats.
+
+    Returns ``None`` when the path should be drawn solid (no dashing):
+    ``dasharray`` is ``None``, empty, or the string ``'none'``.
+
+    Per the SVG specification, a list with an odd number of entries is
+    repeated to make its length even (e.g. ``(5,)`` becomes ``(5, 5)``).
+    Negative or non-finite entries make the attribute illegal, which SVG
+    renderers handle by disabling dashing (solid line).  Such input therefore
+    also returns ``None``.
+    """
+    if dasharray is None:
+        return None
+    if isinstance(dasharray, str):
+        text = dasharray.strip()
+        if text == '' or text.lower() == 'none':
+            return None
+        try:
+            values = [float(token) for token in
+                      re.split(r'[\s,]+', text) if token != '']
+        except ValueError:
+            return None
+    else:
+        try:
+            values = [float(value) for value in dasharray]
+        except (TypeError, ValueError):
+            raise TypeError(
+                "dasharray must be None, 'none', a string of comma/whitespace "
+                "separated numbers, or a sequence of real numbers, not "
+                "{}".format(type(dasharray).__name__))
+        if not values:
+            return None
+
+    if any(not math.isfinite(value) or value < 0 for value in values):
+        # Illegal per SVG spec -> dashing is disabled (rendered solid).
+        return None
+
+    if len(values) % 2 == 1:
+        # Odd-length patterns repeat to even length.
+        values = values + values
+    return tuple(values)
+
+
+def _normalize_dashoffset(dashoffset):
+    """Coerce an SVG ``stroke-dashoffset`` to a finite float.
+
+    Non-finite input has no defined rendering behavior; it is treated as no
+    offset rather than propagating NaN comparisons into the dash loop.
+    """
+    try:
+        offset = float(dashoffset)
+    except (TypeError, ValueError):
+        raise TypeError(
+            "dashoffset must be a real number, not "
+            "{}".format(type(dashoffset).__name__))
+    return offset if math.isfinite(offset) else 0.0
+
+
+def _snap_piece_joints(piece, tol=1e-12):
+    """Force consecutive segments of a painted run to share exact joint
+    points.
+
+    Cropping an Arc rebuilds it from its own endpoints, and elliptical
+    re-parameterization can move the start point by a rounding error
+    (~1e-15).  Left alone, such a run fails Path.iscontinuous() and looks
+    like a break even though the geometry is continuous.  When two adjacent
+    endpoints differ by less than ``tol`` (relative to the coordinate
+    magnitudes), the later segment's start is snapped to the earlier
+    segment's end.  The pieces are mutated in place and also returned.
+    """
+    for i in range(1, len(piece)):
+        prev_end = piece[i - 1].end
+        seg = piece[i]
+        if seg.start == prev_end:
+            continue
+        scale = max(1.0, abs(prev_end), abs(seg.start))
+        if abs(seg.start - prev_end) <= tol * scale:
+            seg.start = prev_end
+            if isinstance(seg, Arc):
+                # point() is derived from the parameterization, so it must be
+                # rebuilt after moving the start point.
+                seg._parameterize()
+    return piece
+
+
+def _arclength_crop(subpath, s0, s1, seg_lengths):
+    """Return a Path tracing ``subpath`` from arc length ``s0`` to ``s1``
+    (both measured from the subpath start).  Handles subpaths made of any
+    mix of Line, QuadraticBezier, CubicBezier and Arc segments, skipping any
+    zero-length segments without calling inverse arc length on them.
+    """
+    total = sum(seg_lengths)
+    assert 0 <= s0 <= s1 <= total
+    if s0 == s1:
+        return Path()
+
+    new_segments = []
+    remaining0 = s0
+    remaining1 = s1
+    # The segment (if any) containing each endpoint is cropped; every segment
+    # strictly between them is copied unchanged.
+    for seg, seg_len in zip(subpath, seg_lengths):
+        if seg_len <= 0:
+            # Zero-length segment: only retained when the whole crop lies at
+            # this point, which is excluded by the s0 == s1 check above.
+            continue
+        if remaining1 <= 0:
+            break
+        if remaining0 >= seg_len:
+            remaining0 -= seg_len
+            remaining1 -= seg_len
+            continue
+        t0 = 0.0 if remaining0 <= 0 else seg.ilength(min(remaining0, seg_len))
+        t1 = 1.0 if remaining1 >= seg_len else seg.ilength(
+            min(max(remaining1, 0.0), seg_len))
+        if t1 > t0:
+            new_segments.append(seg.cropped(t0, t1))
+        remaining0 = 0.0
+        remaining1 -= seg_len
+    return Path(*new_segments)
+
+
+def _dash_on_intervals(length, pattern, offset):
+    """Compute the arc-length intervals of one continuous subpath that are
+    painted, given a finite, non-negative, not-all-zero ``pattern`` and a
+    (possibly negative) ``offset``.
+
+    Returns a list of closed-open ``[start, end)`` pairs in arc length.  The
+    pattern phase is reduced modulo the pattern period first, so a large
+    offset cannot drive the number of loop iterations; every iteration makes
+    strictly monotone progress along the subpath, so the loop is guaranteed
+    to terminate even for very short subpaths.
+    """
+    period = sum(pattern)
+    # SVG: offset shifts the pattern start backwards.  Reducing the phase
+    # modulo the period keeps the number of emitted slots bounded by the
+    # number of pattern repetitions actually covering the subpath.
+    phase = (-offset) % period
+    intervals = []
+    position = 0.0
+    slot_index = 0
+    while position < length:
+        slot_len = pattern[slot_index % len(pattern)]
+        slot_index += 1
+        if slot_len <= 0:
+            continue
+        if phase > 0:
+            # Advance through the already-spent part of the current slot.
+            if phase >= slot_len:
+                phase -= slot_len
+                continue
+            slot_start = position
+            consumed = slot_len - phase
+            phase = 0.0
+        else:
+            slot_start = position
+            consumed = slot_len
+        slot_end = position + consumed
+        if slot_end > length:
+            slot_end = length
+        on_slot = (slot_index - 1) % 2 == 0
+        if on_slot and slot_end > slot_start:
+            intervals.append([slot_start, slot_end])
+        position = slot_end if slot_end > position else position + slot_len
+    return intervals
+
+
 class Path(MutableSequence):
     """A Path is a sequence of path segments"""
 
@@ -3212,9 +3385,9 @@ class Path(MutableSequence):
             self[s:s+1] = list(segment.as_quad_curves(arc_required))
 
     def joints(self):
-        """returns generator of segment joints 
-        
-        I.e. Path(s0, s1, s2, ..., sn).joints() returns generator 
+        """returns generator of segment joints
+
+        I.e. Path(s0, s1, s2, ..., sn).joints() returns generator
             (s0, s1), (s1, s2), ..., (sn, s0)
 
         credit: https://docs.python.org/3/library/itertools.html#recipes
@@ -3222,6 +3395,90 @@ class Path(MutableSequence):
         a, b = tee(self)
         next(b, None)
         return zip(a, b)
+
+    def dashed(self, dasharray, dashoffset=0.0):
+        """Partition this path into the subpaths that would be painted for
+        the given SVG ``stroke-dasharray`` and ``stroke-dashoffset``.
+
+        Arc length is accumulated continuously across segment boundaries,
+        so a dash that runs through a Line, QuadraticBezier, CubicBezier or
+        Arc segment is split correctly at every joint.  Each continuous
+        subpath restarts the dash pattern independently, matching the SVG
+        rendering rules.
+
+        Args:
+            dasharray: the dash pattern as either
+                * ``None``, ``''`` or ``'none'`` -- solid line, no dashing;
+                * an SVG attribute string, e.g. ``'5,3'`` or ``'5 3 2'``;
+                * a sequence of real lengths, e.g. ``(5.0, 3.0)``.
+                Entries alternate on/off starting with an on length.  An
+                odd number of entries is repeated to an even count per the
+                SVG spec.  Negative or non-finite entries disable dashing
+                (the path is returned solid); an all-zero pattern paints
+                nothing.
+            dashoffset (float): distance into the pattern at which painting
+                starts.  Positive values shift the pattern backwards along
+                the path, negative values forwards; either sign is handled.
+                A non-finite offset is treated as zero.
+
+        Returns:
+            list[Path]: one Path per visible (painted) run, in traversal
+            order and grouped by continuous subpath.  Every returned Path is
+            itself continuous and its ``.length()`` equals the arc length of
+            that run.  When dashing is disabled the continuous subpaths of
+            ``self`` are returned unchanged (same segment objects); an empty
+            input path yields an empty list.
+
+        Notes:
+            The pattern phase is reduced modulo the pattern period before
+            iteration and every loop step makes strictly monotone progress
+            in arc length, so arbitrarily large offsets and arbitrarily
+            short subpaths cannot cause an infinite loop.  On a closed
+            subpath, a painted run that wraps across the start/end seam is
+            returned as one geometrically continuous Path rather than two
+            fragments with a spurious break at the seam.
+        """
+        pattern = _parse_dasharray(dasharray)
+        if pattern is None:
+            # Solid line: no dashing.  Return the (unchanged) subpaths so
+            # callers always receive one Path per continuous component.
+            return self.continuous_subpaths()
+        offset = _normalize_dashoffset(dashoffset)
+        if all(value == 0 for value in pattern):
+            # An all-zero pattern renders no stroke at all.
+            return []
+
+        visible_paths = []
+        for subpath in self.continuous_subpaths():
+            seg_lengths = [seg.length() for seg in subpath]
+            total = sum(seg_lengths)
+            if total <= 0:
+                # Zero-length subpaths paint nothing.
+                continue
+
+            intervals = _dash_on_intervals(total, pattern, offset)
+            if not intervals:
+                continue
+
+            # On a closed subpath, merge a painted run that wraps across the
+            # start/end seam into a single geometrically continuous Path,
+            # instead of emitting a pseudo-break at the seam point.
+            closed_seam = (subpath.isclosedac() and len(intervals) > 1 and
+                           intervals[0][0] == 0.0 and
+                           intervals[-1][1] >= total - 1e-12 * total)
+            if closed_seam:
+                first = intervals.pop(0)
+                last = intervals.pop()
+                wrapped = concatpaths([
+                    _arclength_crop(subpath, last[0], total, seg_lengths),
+                    _arclength_crop(subpath, 0.0, first[1], seg_lengths)])
+                visible_paths.append(_snap_piece_joints(wrapped))
+
+            for start, end in intervals:
+                piece = _arclength_crop(subpath, start, end, seg_lengths)
+                if len(piece) > 0:
+                    visible_paths.append(_snap_piece_joints(piece))
+        return visible_paths
 
     def _tokenize_path(self, pathdef):
         command = None
