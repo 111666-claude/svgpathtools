@@ -2493,6 +2493,124 @@ class Arc(object):
             current_t = next_t
 
 
+# Tolerance (in parameter space) used to deduplicate rectangle-boundary
+# crossing parameters in `_segment_rect_crossing_ts`.
+_CLIP_T_TOL = 1e-9
+
+
+def _line_rect_crossing_ts(seg, xmin, xmax, ymin, ymax):
+    """Parameters 0 <= t <= 1 where a Line crosses the lines x=xmin, x=xmax,
+    y=ymin and y=ymax.  Edges the Line is parallel to (or coincident with)
+    contribute no crossings."""
+    x0, y0 = seg.start.real, seg.start.imag
+    dx, dy = seg.end.real - x0, seg.end.imag - y0
+    ts = []
+    if dx != 0:
+        ts.extend([(xmin - x0)/dx, (xmax - x0)/dx])
+    if dy != 0:
+        ts.extend([(ymin - y0)/dy, (ymax - y0)/dy])
+    return [t for t in ts if 0 <= t <= 1]
+
+
+def _bezier_rect_crossing_ts(seg, xmin, xmax, ymin, ymax):
+    """Parameters 0 <= t <= 1 where a Bezier segment crosses the lines
+    x=xmin, x=xmax, y=ymin and y=ymax, found as the real roots in [0, 1] of
+    x(t) - c and y(t) - c.  Edges the segment is coincident with contribute
+    no crossings."""
+    p = seg.poly()
+    px = np.poly1d([c.real for c in p.coeffs])
+    py = np.poly1d([c.imag for c in p.coeffs])
+    ts = []
+    for q in (px - xmin, px - xmax, py - ymin, py - ymax):
+        if not np.any(q.coeffs):
+            continue  # seg lies entirely on this edge's line
+        ts.extend(polyroots01(q))
+    return ts
+
+
+def _arc_rect_crossing_ts(seg, xmin, xmax, ymin, ymax):
+    """Parameters 0 <= t <= 1 where an Arc crosses the lines x=xmin, x=xmax,
+    y=ymin and y=ymax.  With a = radians(seg.theta + seg.delta*t) the arc
+    satisfies x(a) = cx + A*cos(a) + B*sin(a) (and likewise for y(a)), which
+    is solved analytically as R*cos(a - psi) = value - c."""
+    if seg.delta == 0:
+        return []
+    rx, ry = seg.radius.real, seg.radius.imag
+    cos_phi, sin_phi = cos(seg.phi), sin(seg.phi)
+    cx, cy = seg.center.real, seg.center.imag
+    edge_data = [(xmin, rx*cos_phi, -ry*sin_phi, cx),
+                 (xmax, rx*cos_phi, -ry*sin_phi, cx),
+                 (ymin, rx*sin_phi, ry*cos_phi, cy),
+                 (ymax, rx*sin_phi, ry*cos_phi, cy)]
+    period = 360.0/abs(seg.delta)  # angle periodicity, in t units
+    ts = []
+    for value, A, B, C in edge_data:
+        R = sqrt(A*A + B*B)
+        if R == 0:
+            continue
+        v = (value - C)/R
+        if v < -1 or v > 1:
+            continue
+        v = min(1.0, max(-1.0, v))
+        psi = degrees(np.arctan2(B, A))
+        alpha = degrees(acos(v))
+        for a in (psi + alpha, psi - alpha):
+            t = (a - seg.theta)/seg.delta
+            t -= period*np.floor(t/period)  # angle is 2*pi-periodic
+            if 0 <= t <= 1:
+                ts.append(t)
+    return ts
+
+
+def _seg_with_endpoints(seg, start, end):
+    """Returns a copy of `seg` with its on-curve endpoints replaced by
+    `start` and `end`, all other parameters (control points, radius,
+    rotation, flags) unchanged."""
+    if isinstance(seg, Line):
+        return Line(start, end)
+    elif isinstance(seg, QuadraticBezier):
+        return QuadraticBezier(start, seg.control, end)
+    elif isinstance(seg, CubicBezier):
+        return CubicBezier(start, seg.control1, seg.control2, end)
+    elif isinstance(seg, Arc):
+        return Arc(start, radius=seg.radius, rotation=seg.rotation,
+                   large_arc=seg.large_arc, sweep=seg.sweep, end=end,
+                   autoscale_radius=seg.autoscale_radius)
+    else:
+        raise TypeError("unsupported segment type: %r" % type(seg))
+
+
+def _segment_rect_crossing_ts(seg, xmin, xmax, ymin, ymax, slack):
+    """Returns the sorted, deduplicated list of parameters 0 < t < 1 at
+    which `seg` crosses the boundary of the axis-aligned rectangle
+    [xmin, xmax] x [ymin, ymax].
+
+    The per-type solvers work with the infinite lines containing the
+    rectangle's edges, so candidate crossings are filtered to those whose
+    point lies within `slack` of the rectangle itself.  Crossings at (or
+    within _CLIP_T_TOL of) the segment's endpoints are dropped, as are
+    near-duplicate parameters (e.g. a corner crossing found once per
+    adjoining edge)."""
+    if isinstance(seg, Line):
+        ts = _line_rect_crossing_ts(seg, xmin, xmax, ymin, ymax)
+    elif isinstance(seg, (QuadraticBezier, CubicBezier)):
+        ts = _bezier_rect_crossing_ts(seg, xmin, xmax, ymin, ymax)
+    elif isinstance(seg, Arc):
+        ts = _arc_rect_crossing_ts(seg, xmin, xmax, ymin, ymax)
+    else:
+        raise TypeError("unsupported segment type: %r" % type(seg))
+
+    ts = [t for t in ts
+          if (xmin - slack <= seg.point(t).real <= xmax + slack and
+              ymin - slack <= seg.point(t).imag <= ymax + slack)]
+    ts = sorted(t for t in ts if _CLIP_T_TOL < t < 1 - _CLIP_T_TOL)
+    unique_ts = []
+    for t in ts:
+        if not unique_ts or t - unique_ts[-1] > _CLIP_T_TOL:
+            unique_ts.append(t)
+    return unique_ts
+
+
 class Path(MutableSequence):
     """A Path is a sequence of path segments"""
 
@@ -3132,6 +3250,119 @@ class Path(MutableSequence):
             if t_seg1 != 0:
                 new_path.append(seg1.cropped(0, t_seg1))
         return new_path
+
+    def clipped(self, xmin, xmax, ymin, ymax, tol=1e-8):
+        """Clips this path to the axis-aligned rectangular viewport
+        [xmin, xmax] x [ymin, ymax], keeping only the parts of the stroke
+        that lie inside the viewport.
+
+        Returns a list of Path objects, one per continuous inside fragment,
+        in the order the fragments first appear along this path.  Each
+        fragment is made of the original segment types (Line,
+        QuadraticBezier, CubicBezier, Arc) -- curves are split at the
+        viewport boundary, never approximated by polylines -- so every
+        fragment can be serialized with d() and parsed back.  Fragments
+        that are disjoint in the input stay disjoint: no geometry outside
+        the viewport is reconnected or reintroduced.
+
+        The viewport is treated as closed: points lying exactly on its
+        boundary are kept, so tangent touches and curve parts running along
+        an edge are preserved.  If the path is closed and the fragments
+        containing its start and end join across the closure point, they
+        are merged into a single fragment (returned first).
+
+        Behavior for edge cases:
+          * Nothing inside: returns an empty list.
+          * Degenerate viewport: xmin > xmax or ymin > ymax raises
+            ValueError; a zero-width and/or zero-height viewport is allowed
+            and keeps only curve parts lying on that degenerate rectangle.
+          * Zero-length segments are kept only if they lie inside the
+            viewport; cropped pieces shorter than the tolerance are dropped.
+          * tol is an absolute distance tolerance, scaled by the magnitude
+            of the viewport coordinates; points within it of the boundary
+            count as inside.  All output points are guaranteed to lie
+            within this (scaled) tolerance of the viewport.
+        """
+        if xmin > xmax or ymin > ymax:
+            raise ValueError("invalid viewport: require xmin <= xmax and "
+                             "ymin <= ymax, got [%s, %s] x [%s, %s]"
+                             % (xmin, xmax, ymin, ymax))
+        scale = max(1.0, abs(xmin), abs(xmax), abs(ymin), abs(ymax))
+        slack = tol*scale
+
+        def is_inside(z):
+            return (xmin - slack <= z.real <= xmax + slack and
+                    ymin - slack <= z.imag <= ymax + slack)
+
+        subpaths = []
+        current = []
+
+        def flush():
+            if current:
+                subpaths.append(Path(*current))
+                del current[:]
+
+        def emit(piece):
+            if current:
+                gap = abs(piece.start - current[-1].end)
+                if gap > slack:
+                    flush()
+                    current.append(piece)
+                    return
+                if gap:
+                    # restore exact continuity across a skipped sliver or
+                    # a recomputed endpoint (shift is within tol)
+                    piece = _seg_with_endpoints(piece, current[-1].end,
+                                                piece.end)
+                    if piece.start == piece.end:
+                        return  # degenerate after snapping; drop
+            current.append(piece)
+
+        for seg in self:
+            if seg.start == seg.end:
+                # zero-length segment: no interior, keep iff inside
+                if is_inside(seg.start):
+                    emit(seg)
+                else:
+                    flush()
+                continue
+            ts = _segment_rect_crossing_ts(seg, xmin, xmax, ymin, ymax,
+                                           slack)
+            bounds = [0.0] + ts + [1.0]
+            for t0, t1 in zip(bounds[:-1], bounds[1:]):
+                if t0 == 0.0 and t1 == 1.0:
+                    piece = seg  # untouched: keep the original segment
+                else:
+                    piece = seg.cropped(t0, t1)
+                    # cropped() recomputes the endpoints from the curve
+                    # parametrization; restore the segment's exact original
+                    # endpoints where the crop reaches them, so continuous
+                    # input paths yield exactly continuous fragments
+                    if t0 == 0.0 or t1 == 1.0:
+                        piece = _seg_with_endpoints(
+                            piece,
+                            seg.start if t0 == 0.0 else piece.start,
+                            seg.end if t1 == 1.0 else piece.end)
+                if not (t0 == 0.0 and t1 == 1.0) and \
+                        abs(piece.end - piece.start) <= slack:
+                    continue  # degenerate sliver from a near-duplicate split
+                if is_inside(piece.point(0.5)):
+                    emit(piece)
+                else:
+                    flush()
+        flush()
+
+        # If this path is closed, the first and last fragments may be two
+        # ends of a single inside-run crossing the path's start point.
+        if len(subpaths) > 1 and self.isclosed() and \
+                abs(subpaths[-1].end - subpaths[0].start) <= slack:
+            tail, head = list(subpaths[-1]), list(subpaths[0])
+            if head[0].start != tail[-1].end:
+                head[0] = _seg_with_endpoints(head[0], tail[-1].end,
+                                              head[0].end)
+            merged = Path(*(tail + head))
+            subpaths = [merged] + subpaths[1:-1]
+        return subpaths
 
     def radialrange(self, origin, return_all_global_extrema=False):
         """returns the tuples (d_min, t_min, idx_min), (d_max, t_max, idx_max)
