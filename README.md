@@ -30,6 +30,7 @@ Some included tools:
 - compute **area** enclosed by a closed path
 - compute **arc length**
 - compute **inverse arc length**
+- **morph (interpolate) between two closed paths** by arc length, handling different segment counts, cyclic start points, orientation, and holes
 - convert RGB color tuples to hexadecimal color strings and back
 
 ## Prerequisites
@@ -494,6 +495,44 @@ wsvg(paths + offset_paths, 'g'*len(paths) + 'r'*len(offset_paths), filename='off
 ```
 
 ![offset_curves.svg](offset_curves.svg)
+
+### Morphing between two closed paths
+
+`morph_paths()` interpolates between two closed paths at a progress value
+`t` between 0 and 1. The two poses may use different numbers of lines,
+Bézier curves, and arcs; corresponding points are matched by **arc length**
+rather than segment index, so the outline is not torn.
+
+Closed loops whose start points differ or that run in opposite directions
+are aligned automatically (cyclic shift / reversal chosen to minimize
+point-wise distortion), and paths with several subpaths keep their
+outer-contour/hole correspondence. Arcs are approximated by cubic Béziers
+to a configurable geometric tolerance.
+
+```python
+from svgpathtools import Path, Line, Arc, morph_paths
+
+# A rectangle (four lines)...
+rect = Path(Line(0, 2), Line(2, 2+2j), Line(2+2j, 2j), Line(2j, 0))
+
+# ...and a circle (two arcs), both closed.
+center, radius = 1+1j, 1+1j
+circle = Path(Arc(center-1, radius, 0, 1, 1, center+1),
+              Arc(center+1, radius, 0, 1, 1, center-1))
+
+# Intermediate, drawable contour at 40% of the way from rect to circle.
+middle = morph_paths(rect, circle, 0.4)
+
+# t=0 reproduces the first path, t=1 the second (within arc_tolerance).
+assert morph_paths(rect, circle, 0.0).isclosedac()
+
+# Equivalent method form:
+middle = rect.morphed_with(circle, 0.4)
+```
+
+Incompatible inputs raise `MorphError` (a `ValueError` subclass): a
+mismatched number of subpaths/holes, a zero-length contour, an open path,
+non-finite coordinates, or a progress outside `[0, 1]`.
 
 ## Compatibility Notes for users of svg.path (v2.0)
 

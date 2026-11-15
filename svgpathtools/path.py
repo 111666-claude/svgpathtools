@@ -3211,6 +3211,14 @@ class Path(MutableSequence):
             arc_required = int(ceil(abs(segment.delta) / sweep_limit))
             self[s:s+1] = list(segment.as_quad_curves(arc_required))
 
+    def morphed_with(self, other, t, **kwargs):
+        """Returns the closed-path morph between this path and `other` at
+        progress `t`.  See :func:`svgpathtools.morph.morph_paths` for the
+        full documentation and parameters."""
+        # Imported here to avoid a circular import at module load time.
+        from .morph import morph_paths
+        return morph_paths(self, other, t, **kwargs)
+
     def joints(self):
         """returns generator of segment joints 
         
