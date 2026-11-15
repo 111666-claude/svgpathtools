@@ -1,7 +1,12 @@
 # Note: This file was taken mostly as is from the svg.path module (v 2.0)
 from __future__ import division, absolute_import, print_function
+import os
+import tempfile
 import unittest
-from svgpathtools import Path, Line, QuadraticBezier, CubicBezier, Arc, parse_path
+import warnings
+from svgpathtools import (Path, Line, QuadraticBezier, CubicBezier, Arc,
+                          parse_path, parse_transform, SVGSyntaxWarning,
+                          Document, SaxDocument)
 import svgpathtools
 
 import numpy as np
@@ -294,6 +299,263 @@ class TestParser(unittest.TestCase):
                    skewX(40)
                    scale(10 0.5)""")
         ))
+
+    def test_transform_whitespace(self):
+        # Values may be separated by any whitespace (incl. tabs and
+        # newlines), commas, or a mix of both.
+        expected_tf_matrix = np.identity(3)
+        expected_tf_matrix[0:2, 0:3] = np.array([[1.0, 3.0, 5.0],
+                                                 [2.0, 4.0, 6.0]])
+        tf_matrix = parse_transform('matrix(1, 2,\n3  4\t5 6)')
+        self.assertTrue(np.array_equal(expected_tf_matrix, tf_matrix))
+        # The two rows are exactly [1, 3, 5] and [2, 4, 6].
+        self.assertEqual(tf_matrix[0, 0:3].tolist(), [1.0, 3.0, 5.0])
+        self.assertEqual(tf_matrix[1, 0:3].tolist(), [2.0, 4.0, 6.0])
+
+    def test_transform_malformed(self):
+        bad_transforms = ('matrix(1 x 3 4 5 6)',       # non-numeric value
+                          'translate(a)',              # non-numeric value
+                          'scale()',                   # wrong number of values
+                          'rotate(1 2 z)',             # non-numeric value
+                          'bogus(5)',                  # unknown transform type
+                          'notmatrix(1 0 0 1 0 0)',    # unknown transform type
+                          'translate(nan)',            # non-finite value
+                          'scale(1 inf)',              # non-finite value
+                          'translate(1_0)',            # not an SVG number
+                          'scale(1e999)',              # overflows to inf
+                          'foo(1',                     # missing closing paren
+                          'matrix',                    # no parens at all
+                          'matrix(1(2)',               # extra opening paren
+                          'rotate(30))')               # stray closing paren
+
+        # By default, each invalid substring warns and contributes an
+        # identity matrix.  ('rotate(30))' is excluded because its valid
+        # 'rotate(30)' part still applies.
+        identity = np.identity(3)
+        for bad in bad_transforms[:-1]:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter('always')
+                tf = parse_transform(bad)
+            self.assertTrue(caught, msg=bad)
+            self.assertTrue(
+                all(issubclass(w.category, SVGSyntaxWarning) for w in caught),
+                msg=bad)
+            self.assertTrue(np.array_equal(identity, tf), msg=bad)
+
+        # A bad transform only nullifies itself: valid substrings in the
+        # same list still apply, in their original order.
+        expected_tf_translate = np.identity(3)
+        expected_tf_translate[0, 2] = 10
+        expected_tf_translate[1, 2] = 20
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            tf = parse_transform(
+                'translate(10 20) matrix(1 x 3 4 5 6)')
+        self.assertEqual(len(caught), 1)
+        self.assertTrue(np.array_equal(expected_tf_translate, tf))
+
+        # With strict=True, invalid transform syntax raises a ValueError.
+        for bad in bad_transforms:
+            with self.assertRaises(ValueError, msg=bad):
+                parse_transform(bad, strict=True)
+
+        # Error messages identify the offending substring.
+        with self.assertRaisesRegex(ValueError, r'rotate\(1 2'):
+            parse_transform('rotate(1 2)', strict=True)
+
+        # None, '' and 'none' yield identity silently, even in strict
+        # mode; other non-strings raise TypeError.
+        for empty in (None, '', 'none', ' none '):
+            with warnings.catch_warnings():
+                warnings.simplefilter('error')
+                tf = parse_transform(empty, strict=True)
+            self.assertTrue(np.array_equal(identity, tf), msg=repr(empty))
+        for bad_type in (0, False, [], 0.5):
+            with self.assertRaises(TypeError, msg=repr(bad_type)):
+                parse_transform(bad_type)
+
+    def test_transform_separators(self):
+        # Transforms in a list may be separated by whitespace, commas, or
+        # (leniently) nothing at all; all should parse identically, in
+        # strict mode too.
+        expected = parse_transform('translate(10 20) rotate(30)', strict=True)
+        for tf_str in ('translate(10 20),rotate(30)',
+                       'translate(10 20) , rotate(30)',
+                       'translate(10 20)\nrotate(30)',
+                       'translate(10 20)rotate(30)',
+                       # A trailing list-separator comma is harmless.
+                       'translate(10 20),rotate(30),',
+                       'translate(10 20),rotate(30) , '):
+            with warnings.catch_warnings():
+                warnings.simplefilter('error')
+                tf = parse_transform(tf_str, strict=True)
+            self.assertTrue(np.array_equal(expected, tf), msg=tf_str)
+
+    def test_transform_warning_category(self):
+        # Lenient-mode warnings use SVGSyntaxWarning, a UserWarning
+        # subclass, so they can be filtered or escalated selectively
+        # while existing UserWarning filters keep working.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            parse_transform('translate(a)')
+        self.assertTrue(caught)
+        for w in caught:
+            self.assertTrue(issubclass(w.category, SVGSyntaxWarning))
+            self.assertTrue(issubclass(w.category, UserWarning))
+
+    def _write_tmp_svg(self, svg):
+        fd, fname = tempfile.mkstemp(suffix='.svg')
+        with os.fdopen(fd, 'w') as f:
+            f.write(svg)
+        self.addCleanup(os.remove, fname)
+        return fname
+
+    def test_document_strict_transform_parsing(self):
+        svg = ('<svg xmlns="http://www.w3.org/2000/svg">'
+               '<path d="M 0,0 L 1,1" transform="translate(a)"/></svg>')
+
+        # Default: lenient, warns with SVGSyntaxWarning.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            paths = Document.from_svg_string(svg).paths()
+        self.assertEqual(len(paths), 1)
+        self.assertTrue(any(issubclass(w.category, SVGSyntaxWarning)
+                            for w in caught))
+
+        # The warning category can be escalated to an error.
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', SVGSyntaxWarning)
+            with self.assertRaises(SVGSyntaxWarning):
+                Document.from_svg_string(svg).paths()
+
+        # Opt-in strict parsing raises ValueError.
+        doc = Document.from_svg_string(
+            svg, strict_transform_parsing=True)
+        with self.assertRaises(ValueError):
+            doc.paths()
+
+    def test_sax_document_strict_transform_parsing(self):
+        svg = ('<svg xmlns="http://www.w3.org/2000/svg">'
+               '<path d="M 0,0 L 1,1" transform="translate(a)"/></svg>')
+        fname = self._write_tmp_svg(svg)
+
+        # Default: lenient, warns with SVGSyntaxWarning.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            SaxDocument(fname)
+        self.assertTrue(any(issubclass(w.category, SVGSyntaxWarning)
+                            for w in caught))
+
+        # Opt-in strict parsing raises ValueError.
+        with self.assertRaises(ValueError):
+            SaxDocument(fname, strict_transform_parsing=True)
+
+    def test_malformed_transform_import_isolation(self):
+        # A broken transform on one path must not prevent the other
+        # paths (or the valid transforms around it) from being imported.
+        svg = ('<svg xmlns="http://www.w3.org/2000/svg">'
+               '<path d="M 0,0 L 1,1" transform="translate(a)"/>'
+               '<path d="M 0,0 L 1,1" '
+               'transform="translate(10 20) rotate(90)"/>'
+               '<path d="M 0,0 L 1,1"/></svg>')
+        fname = self._write_tmp_svg(svg)
+
+        # ElementTree-based entry point.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            paths = Document.from_svg_string(svg).paths()
+        self.assertEqual(len(paths), 3)
+        self.assertEqual(
+            sum(issubclass(w.category, SVGSyntaxWarning) for w in caught), 1)
+        # The second path's valid translate is applied despite the first
+        # path's broken transform.
+        self.assertAlmostEqual(paths[1][0].start.real, 10.0)
+        self.assertAlmostEqual(paths[1][0].start.imag, 20.0)
+
+        # SAX-based entry point behaves the same at the matrix level.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            doc = SaxDocument(fname)
+        self.assertEqual(len(doc.tree), 3)
+        self.assertEqual(
+            sum(issubclass(w.category, SVGSyntaxWarning) for w in caught), 1)
+        matrices = [m for _d, m in doc.get_pathd_and_matrix()]
+        self.assertTrue(np.array_equal(matrices[0], np.identity(3)))
+        self.assertAlmostEqual(matrices[1][0, 2], 10.0)
+        self.assertAlmostEqual(matrices[1][1, 2], 20.0)
+        self.assertIsNone(matrices[2])
+
+    def test_thousand_malformed_transforms(self):
+        # Importing 1000 paths that each carry a bad transform used to
+        # raise 1000 times and abort the document; it now produces zero
+        # exceptions and a deterministic number of warnings through
+        # either entry point.  Every tenth path also has a valid
+        # transform first, to prove the bad substring only affects
+        # itself.
+        n_paths = 1000
+        parts = []
+        for i in range(n_paths):
+            tf = ('translate(10 20) translate(a)' if i % 10 == 0
+                  else 'translate(a)')
+            parts.append('<path d="M 0,0 L 1,1" transform="{0}"/>'
+                         .format(tf))
+        svg = ('<svg xmlns="http://www.w3.org/2000/svg">'
+               + ''.join(parts) + '</svg>')
+        fname = self._write_tmp_svg(svg)
+
+        def import_document():
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter('always')
+                paths = Document.from_svg_string(svg).paths()
+            n_warnings = sum(issubclass(w.category, SVGSyntaxWarning)
+                             for w in caught)
+            return paths, n_warnings
+
+        def import_sax():
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter('always')
+                doc = SaxDocument(fname)
+            n_warnings = sum(issubclass(w.category, SVGSyntaxWarning)
+                             for w in caught)
+            return doc, n_warnings
+
+        # Lenient: no exceptions, all 1000 paths imported, one warning
+        # per bad substring -- and the result is repeatable.
+        paths, n_warnings = import_document()
+        paths_again, n_warnings_again = import_document()
+        self.assertEqual(len(paths), n_paths)
+        self.assertEqual(n_warnings, n_paths)
+        self.assertEqual(n_warnings_again, n_warnings)
+        self.assertEqual(paths, paths_again)
+        moved = [p for p in paths
+                 if (p[0].start.real, p[0].start.imag) != (0.0, 0.0)]
+        self.assertEqual(len(moved), n_paths // 10)
+        self.assertTrue(all((p[0].start.real, p[0].start.imag) == (10.0, 20.0)
+                            for p in moved))
+
+        sax_doc, sax_warnings = import_sax()
+        sax_doc_again, sax_warnings_again = import_sax()
+        self.assertEqual(len(sax_doc.tree), n_paths)
+        self.assertEqual(sax_warnings, n_paths)
+        self.assertEqual(sax_warnings_again, n_warnings)
+        self.assertEqual(len(sax_doc_again.tree), len(sax_doc.tree))
+        sax_moved = [m for _d, m in sax_doc.get_pathd_and_matrix()
+                     if not np.array_equal(m, np.identity(3))]
+        self.assertEqual(len(sax_moved), n_paths // 10)
+
+        # The two entry points agree on the warning count and on how
+        # many transforms survive.
+        self.assertEqual(n_warnings, sax_warnings)
+        self.assertEqual(len(moved), len(sax_moved))
+
+        # Strict: both entry points refuse the document explicitly.
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            with self.assertRaises(ValueError):
+                Document.from_svg_string(
+                    svg, strict_transform_parsing=True).paths()
+            with self.assertRaises(ValueError):
+                SaxDocument(fname, strict_transform_parsing=True)
 
     def test_pathd_init(self):
         path0 = Path('')
