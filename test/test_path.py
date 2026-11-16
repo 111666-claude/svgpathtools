@@ -12,8 +12,8 @@ import warnings
 # Internal dependencies
 from svgpathtools import (
     Line, QuadraticBezier, CubicBezier, Arc, Path, poly2bez, path_encloses_pt,
-    bpoints2bezier, closest_point_in_path, farthest_point_in_path,
-    is_bezier_segment, is_bezier_path, parse_path
+    point_in_path, bpoints2bezier, closest_point_in_path, farthest_point_in_path,
+    is_bezier_segment, is_bezier_path, parse_path, polygon, concatpaths
 )
 from svgpathtools.path import bezier_radialrange, transform
 
@@ -2147,6 +2147,304 @@ class TestPathBugs(unittest.TestCase):
         # clipping rectangle
         p2 = Path('M166.8359375,235.5478516c0,3.7773438-3.0859375,6.8691406-6.8701172,6.8691406H7.1108398c-3.7749023,0-6.8608398-3.0917969-6.8608398-6.8691406V7.1201172C0.25,3.3427734,3.3359375,0.25,7.1108398,0.25h152.8549805c3.7841797,0,6.8701172,3.0927734,6.8701172,6.8701172v228.4277344z')
         self.assertEqual(len(p1.intersect(p2)), len(p2.intersect(p1)))
+
+
+def _cubic_circle(cx, cy, r, clockwise=False):
+    """Closed unit-style circle of four cubic Beziers centered at (cx, cy)."""
+    k = 0.5522847498307936 * r
+    segs = [
+        CubicBezier(complex(cx + r, cy), complex(cx + r, cy + k),
+                    complex(cx + k, cy + r), complex(cx, cy + r)),
+        CubicBezier(complex(cx, cy + r), complex(cx - k, cy + r),
+                    complex(cx - r, cy + k), complex(cx - r, cy)),
+        CubicBezier(complex(cx - r, cy), complex(cx - r, cy - k),
+                    complex(cx - k, cy - r), complex(cx, cy - r)),
+        CubicBezier(complex(cx, cy - r), complex(cx + k, cy - r),
+                    complex(cx + r, cy - k), complex(cx + r, cy))]
+    path = Path(*segs)
+    assert path.isclosed()
+    return path.reversed() if clockwise else path
+
+
+def _arc_circle(cx, cy, r, sweep=True, rotation=0.0):
+    """Closed circle of two large-arc Arc segments."""
+    top = complex(cx, cy + r)
+    bottom = complex(cx, cy - r)
+    path = Path(
+        Arc(top, complex(r, r), rotation, True, sweep, bottom),
+        Arc(bottom, complex(r, r), rotation, True, sweep, top))
+    assert path.isclosed()
+    return path
+
+
+def _flatten(path, step=0.002):
+    """Dense polygonal sampling of a closed path for reference tests."""
+    pts = []
+    for seg in path:
+        n = max(2, int(seg.length() / step) + 1)
+        chunk = [seg.point(t) for t in np.linspace(0, 1, n)]
+        if pts:
+            chunk = chunk[1:]
+        pts.extend(chunk)
+    if abs(pts[-1] - pts[0]) < 1e-12:
+        pts.pop()
+    return [(p.real, p.imag) for p in pts]
+
+
+def _reference_contains(x, y, polygons, rule):
+    """Brute-force half-open-edge ray casting for both filling rules."""
+    winding = 0
+    parity = 0
+    for poly in polygons:
+        n = len(poly)
+        for i in range(n):
+            x1, y1 = poly[i]
+            x2, y2 = poly[(i + 1) % n]
+            if (y1 <= y < y2) or (y2 <= y < y1):
+                x_intersect = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+                if x_intersect > x:
+                    parity += 1
+                    winding += 1 if y2 > y1 else -1
+    if rule == "nonzero":
+        return winding != 0
+    return parity % 2 == 1
+
+
+class TestPointInPath(unittest.TestCase):
+    """Tests for the compound-subpath point-in-fill-region function."""
+
+    def setUp(self):
+        # Rectangular outer loop with a square inner loop.
+        self.rect_outer = polygon(0, 20, 20 + 20j, 20j)
+        self.rect_inner_cw = polygon(6 + 6j, 6 + 14j, 14 + 14j, 14 + 6j)
+        self.rect_inner_ccw = polygon(6 + 6j, 14 + 6j, 14 + 14j, 6 + 14j)
+        # Curved (cubic) and arc rings.
+        self.cubic_outer = _cubic_circle(10, 10, 10)
+        self.cubic_inner_cw = _cubic_circle(10, 10, 4, clockwise=True)
+        self.cubic_inner_ccw = _cubic_circle(10, 10, 4)
+        self.arc_outer = _arc_circle(10, 10, 10, sweep=True)
+        self.arc_inner_cw = _arc_circle(10, 10, 4, sweep=False)
+        self.arc_inner_ccw = _arc_circle(10, 10, 4, sweep=True)
+
+    # ------------------------------------------------------------------
+    # Single closed contours
+    # ------------------------------------------------------------------
+    def test_single_rectangle(self):
+        self.assertTrue(point_in_path(10 + 10j, self.rect_outer))
+        self.assertTrue(point_in_path(0.001 + 0.001j, self.rect_outer))
+        self.assertFalse(point_in_path(30 + 30j, self.rect_outer))
+        self.assertFalse(point_in_path(-1 + 10j, self.rect_outer))
+
+    def test_single_cubic_and_arc_circle(self):
+        for path in (self.cubic_outer, self.arc_outer):
+            self.assertTrue(point_in_path(10 + 10j, path))
+            self.assertTrue(point_in_path(10 + 5j, path))
+            self.assertFalse(point_in_path(25 + 10j, path))
+            self.assertFalse(point_in_path(10 - 11j, path))
+
+    # ------------------------------------------------------------------
+    # Compound contours under both filling rules
+    # ------------------------------------------------------------------
+    def test_opposite_direction_inner_loop_is_a_hole(self):
+        for paths in ((self.rect_outer, self.rect_inner_cw),
+                      (self.cubic_outer, self.cubic_inner_cw),
+                      (self.arc_outer, self.arc_inner_cw)):
+            # The hole itself is outside the filled region under both rules.
+            self.assertFalse(
+                point_in_path(10 + 10j, paths, rule="nonzero"))
+            self.assertFalse(
+                point_in_path(10 + 10j, paths, rule="evenodd"))
+            # Material between the loops stays filled.  (17, 10) lies inside
+            # every outer contour (the radius-10 circles reach x=20) yet
+            # outside every inner loop (radius 4 / the 6..14 square).
+            self.assertTrue(point_in_path(17 + 10j, paths))
+            # Outside the outer loop is empty.
+            self.assertFalse(point_in_path(40 + 40j, paths))
+
+    def test_same_direction_inner_loop_distinguishes_rules(self):
+        for paths in ((self.rect_outer, self.rect_inner_ccw),
+                      (self.cubic_outer, self.cubic_inner_ccw),
+                      (self.arc_outer, self.arc_inner_ccw)):
+            # Winding numbers add up: nonzero keeps the inner region filled.
+            self.assertTrue(
+                point_in_path(10 + 10j, paths, rule="nonzero"))
+            # Even-odd only counts crossings: the inner region is a hole.
+            self.assertFalse(
+                point_in_path(10 + 10j, paths, rule="evenodd"))
+            self.assertTrue(point_in_path(17 + 10j, paths, rule="evenodd"))
+
+    def test_triple_nesting(self):
+        outer = polygon(0, 20, 20 + 20j, 20j)
+        middle_cw = polygon(4 + 4j, 4 + 16j, 16 + 16j, 16 + 4j)
+        inner_ccw = polygon(8 + 8j, 12 + 8j, 12 + 12j, 8 + 12j)
+        rings = (outer, middle_cw, inner_ccw)
+        # Depth 1 and depth 3 regions are filled, depth 2 is a hole.
+        self.assertTrue(point_in_path(2 + 2j, rings, "nonzero"))
+        self.assertFalse(point_in_path(6 + 6j, rings, "nonzero"))
+        self.assertTrue(point_in_path(10 + 10j, rings, "nonzero"))
+        # Even-odd agrees here (odd depth filled).
+        self.assertTrue(point_in_path(2 + 2j, rings, "evenodd"))
+        self.assertFalse(point_in_path(6 + 6j, rings, "evenodd"))
+        self.assertTrue(point_in_path(10 + 10j, rings, "evenodd"))
+
+    def test_disjoint_contours(self):
+        lake1 = polygon(0, 5, 5 + 5j, 5j)
+        lake2 = polygon(20 + 20j, 25 + 20j, 25 + 25j, 20 + 25j)
+        lakes = (lake1, lake2)
+        self.assertTrue(point_in_path(2 + 2j, lakes))
+        self.assertTrue(point_in_path(22 + 22j, lakes))
+        self.assertFalse(point_in_path(10 + 10j, lakes))
+        self.assertFalse(point_in_path(30 + 2j, lakes))
+
+    def test_compound_path_with_continuous_subpaths(self):
+        # A single Path object holding two continuous closed subpaths.
+        compound = concatpaths([self.rect_outer, self.rect_inner_cw])
+        self.assertEqual(len(compound.continuous_subpaths()), 2)
+        self.assertFalse(point_in_path(10 + 10j, compound))
+        self.assertTrue(point_in_path(2 + 2j, compound))
+
+    # ------------------------------------------------------------------
+    # Boundary ownership
+    # ------------------------------------------------------------------
+    def test_boundary_strategy_is_consistent(self):
+        contours = (
+            self.rect_outer, self.cubic_outer, self.arc_outer,
+            _arc_circle(10, 10, 10, rotation=37.0),
+            Path(QuadraticBezier(0, 5 + 10j, 10 + 0j),
+                 QuadraticBezier(10 + 0j, 5 - 5j, 0)))
+        for path in contours:
+            for seg in path:
+                for t in np.linspace(0, 1, 25):
+                    pt = complex(seg.point(t))
+                    self.assertTrue(
+                        point_in_path(pt, path, boundary="inside"))
+                    self.assertFalse(
+                        point_in_path(pt, path, boundary="outside"))
+
+    def test_boundary_vertices_and_horizontal_edges(self):
+        rect = self.rect_outer
+        # All four corners are boundary vertices.
+        for vertex in (0 + 0j, 20 + 0j, 20 + 20j, 0 + 20j):
+            self.assertTrue(point_in_path(vertex, rect))
+            self.assertFalse(
+                point_in_path(vertex, rect, boundary="outside"))
+        # Midpoints of horizontal edges.
+        for pt in (10 + 0j, 10 + 20j):
+            self.assertTrue(point_in_path(pt, rect))
+            self.assertFalse(
+                point_in_path(pt, rect, boundary="outside"))
+        # Neighbors on either side of a horizontal edge.
+        self.assertFalse(point_in_path(10 - 1e-6j, rect))
+        self.assertTrue(point_in_path(10 + 1e-6j, rect))
+
+    def test_curve_tangency_not_double_counted(self):
+        # Closed path whose upper cubic is tangent to a horizontal ray.
+        path = Path(CubicBezier(0, 3 + 6j, 7 + 6j, 10 + 0j),
+                    CubicBezier(10 + 0j, 7 - 6j, 3 - 6j, 0))
+        ts = np.linspace(0, 1, 4001)
+        ys = [path[0].point(t).imag for t in ts]
+        t_star = ts[int(np.argmax(ys))]
+        tangent_pt = complex(path[0].point(t_star))
+        self.assertTrue(point_in_path(tangent_pt, path))
+        self.assertFalse(
+            point_in_path(tangent_pt, path, boundary="outside"))
+        self.assertTrue(point_in_path(
+            complex(tangent_pt.real, tangent_pt.imag - 1e-4), path))
+        self.assertFalse(point_in_path(
+            complex(tangent_pt.real, tangent_pt.imag + 1e-4), path))
+
+    def test_shared_vertex_between_contours(self):
+        # Two squares sharing the vertical strip's vertices at (5, 0)/(5, 5).
+        left = polygon(0, 5, 5 + 5j, 5j)
+        right = polygon(5 + 0j, 10 + 0j, 10 + 5j, 5 + 5j)
+        for rule in ("nonzero", "evenodd"):
+            self.assertTrue(point_in_path(2 + 2.5j, [left, right], rule))
+            self.assertTrue(point_in_path(8 + 2.5j, [left, right], rule))
+            self.assertFalse(point_in_path(12 + 2.5j, [left, right], rule))
+            # Shared vertices are boundary points.
+            self.assertTrue(point_in_path(5 + 0j, [left, right], rule))
+            self.assertFalse(
+                point_in_path(5 + 0j, [left, right], rule,
+                              boundary="outside"))
+
+    def test_tolerance_controls_near_boundary_detection(self):
+        near_pt = complex(20 + 5e-10, 10)  # just outside the right edge
+        self.assertFalse(point_in_path(near_pt, self.rect_outer, tol=1e-12))
+        self.assertTrue(point_in_path(near_pt, self.rect_outer, tol=1e-8))
+        self.assertFalse(
+            point_in_path(near_pt, self.rect_outer, tol=1e-8,
+                          boundary="outside"))
+
+    # ------------------------------------------------------------------
+    # Exhaustive cross-check against a brute-force reference
+    # ------------------------------------------------------------------
+    def test_grid_sweep_matches_reference(self):
+        ring_sets = {
+            "rect-opp": [self.rect_outer, self.rect_inner_cw],
+            "rect-same": [self.rect_outer, self.rect_inner_ccw],
+            "cubic-opp": [self.cubic_outer, self.cubic_inner_cw],
+            "cubic-same": [self.cubic_outer, self.cubic_inner_ccw],
+            "arc-opp": [self.arc_outer, self.arc_inner_cw],
+            "arc-same": [self.arc_outer, self.arc_inner_ccw],
+        }
+        xs = np.arange(-3, 23.5, 0.731)
+        ys = np.arange(-3, 23.5, 0.691)
+        for paths in ring_sets.values():
+            reference_polygons = [_flatten(subpath) for subpath in paths]
+            for rule in ("nonzero", "evenodd"):
+                for x in xs:
+                    for y in ys:
+                        got = point_in_path(
+                            complex(x, y), paths, rule=rule)
+                        expected = _reference_contains(
+                            x, y, reference_polygons, rule)
+                        self.assertEqual(
+                            got, expected,
+                            msg="x={}, y={}, rule={}".format(x, y, rule))
+
+    # ------------------------------------------------------------------
+    # Input validation and immutability
+    # ------------------------------------------------------------------
+    def test_invalid_inputs_raise(self):
+        rect = self.rect_outer
+        with self.assertRaises(ValueError):
+            point_in_path(5 + 5j, Path(Line(0, 1), Line(1, 2j)))  # open
+        with self.assertRaises(ValueError):
+            point_in_path(5 + 5j, [])                            # empty list
+        with self.assertRaises(ValueError):
+            point_in_path(5 + 5j, Path())                        # empty Path
+        with self.assertRaises(ValueError):
+            point_in_path(5 + 5j, rect, rule="winding")         # bad rule
+        with self.assertRaises(ValueError):
+            point_in_path(5 + 5j, rect, boundary="edge")        # bad boundary
+        with self.assertRaises(ValueError):
+            point_in_path(complex(float("inf"), 0), rect)       # non-finite
+        with self.assertRaises(ValueError):
+            point_in_path(complex(float("nan"), 0), rect)
+        with self.assertRaises(ValueError):
+            point_in_path(5 + 5j, rect, tol=-1e-9)
+        with self.assertRaises(TypeError):
+            point_in_path(5 + 5j, 42)
+        with self.assertRaises(TypeError):
+            point_in_path(5 + 5j, [42])
+        # A subpath carrying a non-finite control point.
+        broken = Path(
+            Line(0, complex(float("nan"), 1)),
+            Line(complex(float("nan"), 1), 10 + 10j),
+            Line(10 + 10j, 0))
+        with self.assertRaises(ValueError):
+            point_in_path(5 + 5j, broken)
+
+    def test_input_paths_are_not_modified(self):
+        import copy
+        paths = [self.rect_outer, self.rect_inner_cw]
+        snapshot = copy.deepcopy(paths)
+        compound = concatpaths(paths)
+        compound_snapshot = copy.deepcopy(compound)
+        point_in_path(10 + 10j, paths)
+        point_in_path(10 + 10j, compound)
+        self.assertEqual(paths, snapshot)
+        self.assertEqual(compound, compound_snapshot)
 
 
 if __name__ == '__main__':

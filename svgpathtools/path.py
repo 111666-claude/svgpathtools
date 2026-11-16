@@ -19,7 +19,7 @@ from functools import reduce
 # in order to encourage code that generalizes to vector inputs
 from numpy import sqrt, cos, sin, tan, arccos as acos, arcsin as asin, \
     degrees, radians, log, pi, ceil
-from numpy import exp, sqrt as csqrt, angle as phase, isnan
+from numpy import exp, sqrt as csqrt, angle as phase, isnan, isfinite
 
 try:
     from scipy.integrate import quad
@@ -515,6 +515,392 @@ def path_encloses_pt(pt, opt, path):
         return True
     else:
         return False
+
+
+# Filling rules accepted by point_in_path() (see the SVG fill-rule property).
+_EVENODD = "evenodd"
+_NONZERO = "nonzero"
+_VALID_RULES = (_EVENODD, _NONZERO)
+# Boundary ownership strategies accepted by point_in_path().
+_BOUNDARY_INSIDE = "inside"
+_BOUNDARY_OUTSIDE = "outside"
+_VALID_BOUNDARY = (_BOUNDARY_INSIDE, _BOUNDARY_OUTSIDE)
+
+
+def _is_finite_point(pt):
+    """True if pt is a finite point in the complex plane."""
+    try:
+        return bool(isfinite(pt.real) and isfinite(pt.imag))
+    except AttributeError:
+        return False
+
+
+def _point_on_segment(pt, seg, tol):
+    """Returns True if pt lies on seg, within a distance of tol.
+
+    Line, QuadraticBezier and CubicBezier segments are handled with their
+    (exact, polynomial based) radialrange() method.  Arc segments are tested
+    against the equation of their underlying ellipse; a radius of zero
+    degenerates an Arc into a Line."""
+    if isinstance(seg, Arc):
+        if seg.radius.real == 0 or seg.radius.imag == 0:
+            # Degenerate arc: the SVG spec treats this as a Line.
+            d = Line(seg.start, seg.end).radialrange(pt)[0][0]
+            return d <= tol
+        # Check the ellipse equation in the unit-circle frame (this is
+        # rotation agnostic, unlike Arc.point_to_t which only supports
+        # rotation == 0).
+        u = seg.u1transform(pt)
+        if abs(u.real*u.real + u.imag*u.imag - 1.0) > tol:
+            return False
+        # Then verify the point falls on this particular arc, not merely on
+        # the underlying full ellipse: recover its phase and compare it
+        # against the swept angular interval.
+        point_phase = phase(u)
+        start_phase = radians(seg.theta)
+        span = radians(seg.delta)
+        t = (point_phase - start_phase) / span
+        in_arc = False
+        for shift in (-1.0, 0.0, 1.0):
+            if -1e-9 <= t + shift <= 1.0 + 1e-9:
+                in_arc = True
+                break
+        return in_arc
+    dist = seg.radialrange(pt)[0][0]
+    return dist <= tol
+
+
+def _ray_roots_bezier(seg, y0, tol):
+    """Parameter values t in [0, 1] at which the (Line or Bezier) segment
+    seg reaches the horizontal line y == y0.  Endpoint roots are included;
+    numerically repeated roots (tangencies) are returned only once.
+
+    Roots are snapped to an endpoint only when they are geometrically
+    indistinguishable from it (within tol), never by a fixed parameter
+    epsilon: a root at t == 1e-9 on a long, slowly turning curve is a real
+    interior crossing, not a vertex."""
+    ypoly = imag(seg.poly())
+    ypoly = ypoly - y0
+    if ypoly.order == 0:
+        # Constant y: the whole segment lies on the ray's supporting line.
+        # Horizontal edges contribute nothing under the half-open edge
+        # convention, so there is nothing to return.
+        return []
+    roots = polyroots01(ypoly)
+    cleaned = []
+    for t in roots:
+        t = float(t)
+        # Snap only when the evaluated point coincides with an endpoint to
+        # within the geometric tolerance, so vertices are handled by the
+        # joint logic without swallowing genuine near-endpoint crossings.
+        if abs(seg.point(t) - seg.start) <= tol:
+            t = 0.0
+        elif abs(seg.point(t) - seg.end) <= tol:
+            t = 1.0
+        elif not (-1e-10 <= t <= 1.0 + 1e-10):
+            continue
+        if not any(abs(t - u) <= 1e-10 for u in cleaned):
+            cleaned.append(t)
+    return cleaned
+
+
+def _ray_roots_arc(seg, y0, tol):
+    """Parameter values t in [0, 1] at which the Arc seg reaches the
+    horizontal line y == y0.  Solves seg.point(t).imag == y0 analytically
+    (the y-coordinate of an Arc is sinusoidal in t), which keeps tangent
+    roots exact instead of relying on generic curve intersection."""
+    if seg.radius.real == 0 or seg.radius.imag == 0:
+        return _ray_roots_bezier(Line(seg.start, seg.end), y0, tol)
+    phi = radians(seg.rotation)
+    rx = seg.radius.real
+    ry = seg.radius.imag
+    # point(t).imag == cy + rx*sin(phi)*cos(angle) + ry*cos(phi)*sin(angle),
+    # angle = radians(theta + t*delta).
+    a = rx * sin(phi)
+    b = ry * cos(phi)
+    c = y0 - seg.center.imag
+    amplitude = sqrt(a*a + b*b)
+    if amplitude == 0:
+        return []
+    ratio = c / amplitude
+    if ratio < -1.0:
+        ratio = -1.0
+    elif ratio > 1.0:
+        ratio = 1.0
+    base = acos(ratio)
+    # a*cos(u) + b*sin(u) == amplitude*cos(u - eta), where
+    # cos(eta) == a/amplitude and sin(eta) == b/amplitude, hence
+    # eta == atan2(b, a).
+    eta = phase(a + 1j*b)
+    start_angle = radians(seg.theta)
+    angular_span = radians(seg.delta)
+    if angular_span == 0:
+        return []
+    candidates = (eta + base, eta - base)
+    roots = []
+    period = 2*pi
+    # The parameterized angle sweeps an interval of length |delta| <= 2*pi,
+    # so at most one period shift needs to be inspected at each end.
+    for angle0 in candidates:
+        for k in (-1, 0, 1):
+            t = float((angle0 + k*period - start_angle) / angular_span)
+            if not (-1e-10 <= t <= 1.0 + 1e-10):
+                continue
+            if abs(seg.point(t) - seg.start) <= tol:
+                t = 0.0
+            elif abs(seg.point(t) - seg.end) <= tol:
+                t = 1.0
+            if not any(abs(t - u) <= 1e-10 for u in roots):
+                roots.append(t)
+    return roots
+
+
+def _segment_side_at_endpoint(seg, endpoint_t, y0, tol):
+    """Geometric side of the horizontal line y == y0 on which the body of
+    seg lies immediately next to its endpoint (endpoint_t == 0 for the
+    start, 1 for the end).
+
+    Returns +1 if the nearby segment points are above the line, -1 if below,
+    0 if the segment stays on the line to within tol.  This is a purely
+    geometric notion (the side the curve occupies), independent of the
+    segment's traversal direction: the endpoint tangent is used only as a
+    fast decision, with its sign adjusted so that a start and an end of the
+    same geometric arc report the same side.  A near-horizontal tangent
+    falls back to sampling a point just inside the segment."""
+    dy = seg.derivative(endpoint_t).imag
+    if abs(dy) > tol:
+        side = 1 if dy > 0 else -1
+        # At the end endpoint the segment approaches from the opposite side
+        # of its outgoing direction.
+        return side if endpoint_t == 0 else -side
+    eps = 1e-9
+    if endpoint_t == 0:
+        probe_y = seg.point(min(1.0, eps)).imag
+    else:
+        probe_y = seg.point(max(0.0, 1.0 - eps)).imag
+    if abs(probe_y - y0) <= tol:
+        return 0
+    side = 1 if probe_y > y0 else -1
+    # The probe is taken inside the segment, so it sits directly on the
+    # body's geometric side; no orientation flip is needed here.
+    return side
+
+
+def _interior_crossing_weight(seg, t, pt, tol):
+    """Winding contribution of a strictly interior root t (0 < t < 1) where
+    seg crosses the horizontal ray starting at pt and pointing in the +x
+    direction.  Returns 0 for a tangency or a crossing behind pt.
+
+    Sign convention (standard winding-number ray rule): an upward crossing
+    of the east-pointing ray contributes +1, a downward crossing -1, so a
+    counter-clockwise contour accumulates winding +1 at interior points."""
+    point = seg.point(t)
+    if point.real < pt.real - tol:
+        return 0
+    dy = seg.derivative(t).imag
+    if abs(dy) <= tol:
+        # Interior tangency (or numerical near-tangency): a ray that only
+        # touches the boundary does not cross it.
+        return 0
+    return 1 if dy > 0 else -1
+
+
+def _subpath_crossings(subpath, pt, tol):
+    """Computes (winding, parity_crossings) that the horizontal ray from pt
+    in the +x direction accumulates against one closed, continuous subpath.
+
+    Interior crossings are counted per segment with their signed direction;
+    crossings at vertices are decided once per vertex from the geometric
+    sides of both incident segments, so tangent points, shared vertices,
+    horizontal edges and numerically near-coincident intersections are never
+    counted twice."""
+    y0 = pt.imag
+    winding = 0
+    parity = 0
+    n = len(subpath)
+    # Vertices lying on the ray, keyed by vertex index.  A vertex is added
+    # whenever any segment reaches the ray at an endpoint; both incident
+    # segments are then evaluated explicitly so the decision never depends
+    # on which segment happened to report the endpoint root.
+    ray_vertices = set()
+    for idx, seg in enumerate(subpath):
+        if isinstance(seg, Arc):
+            roots = _ray_roots_arc(seg, y0, tol)
+        else:
+            roots = _ray_roots_bezier(seg, y0, tol)
+        for t in roots:
+            if 0.0 < t < 1.0:
+                weight = _interior_crossing_weight(seg, t, pt, tol)
+                winding += weight
+                parity += abs(weight)
+            elif t == 0.0:
+                ray_vertices.add(idx)
+            else:
+                ray_vertices.add((idx + 1) % n)
+
+    for vertex_idx in ray_vertices:
+        in_seg = subpath[(vertex_idx - 1) % n]
+        out_seg = subpath[vertex_idx]
+        # Geometric sides of the segment bodies meeting at the vertex.
+        side_in = _segment_side_at_endpoint(in_seg, 1, y0, tol)
+        side_out = _segment_side_at_endpoint(out_seg, 0, y0, tol)
+        # A vertex on the ray contributes according to the same standard
+        # +x-ray winding rule as an interior crossing: an upward traversal
+        # (arrives below, leaves above) is +1, a downward traversal (arrives
+        # above, leaves below) is -1.  This single half-open rule handles
+        # every configuration:
+        #   * transverse vertex (opposite sides): counted once, with sign;
+        #   * smooth local-extremum tangency (same side): not counted;
+        #   * a sharp V vertex or a run along the ray: not counted, as the
+        #     two implied shifted-ray cuts cancel.
+        if side_in == -1 and side_out == 1:
+            weight = 1
+        elif side_in == 1 and side_out == -1:
+            weight = -1
+        else:
+            continue
+        vertex_point = out_seg.start
+        if vertex_point.real < pt.real - tol:
+            continue
+        winding += weight
+        parity += 1
+    return winding, parity
+
+
+def _normalize_subpaths(paths):
+    """Validates the user's contour input and returns a flat list of closed,
+    continuous Path objects (one per closed subpath).  The input Path
+    objects are never modified; continuous_subpaths() builds fresh Paths."""
+    if isinstance(paths, Path):
+        candidates = paths.continuous_subpaths()
+    else:
+        try:
+            candidates = list(paths)
+        except TypeError:
+            raise TypeError(
+                "paths must be a Path or an iterable of closed Path "
+                "objects, got {}".format(type(paths).__name__))
+        if not candidates:
+            raise ValueError("paths must contain at least one closed Path.")
+        expanded = []
+        for candidate in candidates:
+            if not isinstance(candidate, Path):
+                raise TypeError(
+                    "every contour must be a Path object, got {}".format(
+                        type(candidate).__name__))
+            expanded.extend(candidate.continuous_subpaths())
+        candidates = expanded
+    subpaths = []
+    for subpath in candidates:
+        if len(subpath) == 0:
+            raise ValueError("paths contains an empty (sub)path.")
+        if not subpath.iscontinuous():
+            # continuous_subpaths() guarantees continuity, so this only
+            # guards against malformed direct input.
+            raise ValueError("every (sub)path must be continuous.")
+        if not subpath.isclosed():
+            raise ValueError(
+                "every (sub)path must be closed; an unclosed subpath was "
+                "given.")
+        subpaths.append(subpath)
+    if not subpaths:
+        raise ValueError("paths must contain at least one closed Path.")
+    return subpaths
+
+
+def point_in_path(pt, paths, rule="nonzero", boundary="inside", tol=1e-9):
+    """Determines whether the point pt lies in the region filled by a
+    compound contour made of one or more closed subpaths (e.g. a lake
+    outline containing island holes).
+
+    Args:
+        pt (complex): the point to test.
+        paths (Path or iterable[Path]): a single closed Path (possibly
+            containing several continuous subpaths) or an iterable of
+            closed Path objects, each a closed contour.  Inner loops may be
+            oriented in either direction.
+        rule (str): either ``"nonzero"`` or ``"evenodd"``; selects the SVG
+            filling rule used to decide which regions enclosed by the
+            nested subpaths are filled.
+        boundary (str): ``"inside"`` (default) or ``"outside"``; controls
+            ownership of points lying exactly on a subpath boundary.  The
+            choice is applied consistently to every boundary point.
+        tol (float): distance tolerance for boundary detection and for
+            merging numerically coincident ray intersections (vertices and
+            near-tangent intersections).
+
+    Returns:
+        bool: True if pt belongs to the filled region under the given rule.
+
+    Raises:
+        ValueError: if paths is empty or contains an empty, open or
+            discontinuous subpath, if rule or boundary is not one of the
+            supported strings, or if any coordinate involved is not finite.
+        TypeError: if paths is not a Path / iterable of Paths.
+
+    Notes:
+        Crossings are found from the actual curves: Line and Bezier
+        segments are intersected analytically through their coordinate
+        polynomials and Arc segments through the trigonometric equation of
+        their underlying ellipse.  A horizontal ray cast from pt in the +x
+        direction is used with a half-open edge convention, so tangent
+        points, shared vertices and horizontal edges are never counted
+        twice.  The input paths are never modified.
+    """
+    if not isinstance(pt, complex) or not _is_finite_point(pt):
+        raise ValueError("pt must be a finite complex number.")
+    if rule not in _VALID_RULES:
+        raise ValueError(
+            "rule must be one of {}, got {!r}.".format(_VALID_RULES, rule))
+    if boundary not in _VALID_BOUNDARY:
+        raise ValueError(
+            "boundary must be one of {}, got {!r}.".format(
+                _VALID_BOUNDARY, boundary))
+    if not isfinite(tol) or tol < 0:
+        raise ValueError("tol must be a finite, non-negative number.")
+
+    subpaths = _normalize_subpaths(paths)
+
+    # Validate every coordinate up front (including control points and Arc
+    # geometry) so non-finite input always raises rather than silently
+    # producing a misleading answer.
+    for subpath in subpaths:
+        for seg in subpath:
+            for point in (seg.start, seg.end):
+                if not _is_finite_point(point):
+                    raise ValueError(
+                        "all path coordinates must be finite numbers.")
+            if isinstance(seg, Arc):
+                if not (isfinite(seg.radius.real) and
+                        isfinite(seg.radius.imag) and
+                        isfinite(seg.rotation) and
+                        _is_finite_point(seg.center)):
+                    raise ValueError(
+                        "all Arc parameters must be finite numbers.")
+            else:
+                for point in seg.bpoints():
+                    if not _is_finite_point(point):
+                        raise ValueError(
+                            "all path coordinates must be finite numbers.")
+
+    # Boundary detection runs first across every segment so that a boundary
+    # point never depends on crossing bookkeeping; its ownership is decided
+    # solely by the `boundary` strategy, consistently for every subpath.
+    for subpath in subpaths:
+        for seg in subpath:
+            if _point_on_segment(pt, seg, tol):
+                return boundary == _BOUNDARY_INSIDE
+
+    winding_total = 0
+    crossing_count = 0
+    for subpath in subpaths:
+        sub_winding, sub_parity = _subpath_crossings(subpath, pt, tol)
+        winding_total += sub_winding
+        crossing_count += sub_parity
+
+    if rule == _NONZERO:
+        return winding_total != 0
+    return crossing_count % 2 == 1
 
 
 def segment_length(curve, start, end, start_point, end_point,
