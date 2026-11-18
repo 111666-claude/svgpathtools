@@ -3008,6 +3008,20 @@ class Path(MutableSequence):
                 bezier_path_approximation.append(seg)
         return area_without_arcs(Path(*bezier_path_approximation))
 
+    def area_moments(self, error=1e-12, min_depth=5, max_depth=50):
+        """Signed area, centroid, central second moments and principal
+        axes of the region enclosed by this (closed) path.
+
+        Unlike `area()`, this handles Arc segments with an adaptive
+        quadrature controlled by `error`, and additionally returns the
+        area centroid and second moments -- e.g. for rotating a shape
+        about its true area centroid rather than its bounding-box
+        center.  See `svgpathtools.moments.area_moments` for details.
+        """
+        from .moments import area_moments
+        return area_moments(self, error=error, min_depth=min_depth,
+                            max_depth=max_depth)
+
     def intersect(self, other_curve, justonemode=False, tol=1e-12):
         """Finds intersections of `self` with `other_curve`
 
