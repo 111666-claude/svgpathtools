@@ -9,6 +9,9 @@ from .path import (Path, Line, QuadraticBezier, CubicBezier, Arc,
                    path_encloses_pt, bbox2path, polygon, polyline)
 from .parser import parse_path, parse_transform, SVGSyntaxWarning
 from .paths2svg import disvg, wsvg, paths2Drawing
+from .distance import (distance, segment_distance, path_distance,
+                       SegmentDistance, PathDistance,
+                       DEFAULT_DISTANCE_TOL)
 from .polytools import polyroots, polyroots01, rational_limit, real, imag
 from .misctools import hex2rgb, rgb2hex
 from .smoothing import smoothed_path, smoothed_joint, is_differentiable, kinks

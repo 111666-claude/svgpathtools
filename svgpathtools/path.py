@@ -895,6 +895,14 @@ class Line(object):
         """Scale transform.  See `scale` function for further explanation."""
         return scale(self, sx=sx, sy=sy, origin=origin)
 
+    def distance(self, other, tol=1e-9):
+        """Minimum distance from this segment to another segment or path.
+
+        See :func:`svgpathtools.distance` for the return type and the
+        meaning of ``tol``."""
+        from .distance import distance as _distance
+        return _distance(self, other, tol=tol)
+
 
 class QuadraticBezier(object):
     # For compatibility with old pickle files.
@@ -1164,6 +1172,14 @@ class QuadraticBezier(object):
         """Scale transform.  See `scale` function for further explanation."""
         return scale(self, sx=sx, sy=sy, origin=origin)
 
+    def distance(self, other, tol=1e-9):
+        """Minimum distance from this segment to another segment or path.
+
+        See :func:`svgpathtools.distance` for the return type and the
+        meaning of ``tol``."""
+        from .distance import distance as _distance
+        return _distance(self, other, tol=tol)
+
 
 class CubicBezier(object):
     # For compatibility with old pickle files.
@@ -1428,6 +1444,14 @@ class CubicBezier(object):
     def scaled(self, sx, sy=None, origin=0j):
         """Scale transform.  See `scale` function for further explanation."""
         return scale(self, sx=sx, sy=sy, origin=origin)
+
+    def distance(self, other, tol=1e-9):
+        """Minimum distance from this segment to another segment or path.
+
+        See :func:`svgpathtools.distance` for the return type and the
+        meaning of ``tol``."""
+        from .distance import distance as _distance
+        return _distance(self, other, tol=tol)
 
 
 class Arc(object):
@@ -2492,6 +2516,14 @@ class Arc(object):
             p_start = p_end
             current_t = next_t
 
+    def distance(self, other, tol=1e-9):
+        """Minimum distance from this segment to another segment or path.
+
+        See :func:`svgpathtools.distance` for the return type and the
+        meaning of ``tol``."""
+        from .distance import distance as _distance
+        return _distance(self, other, tol=tol)
+
 
 class Path(MutableSequence):
     """A Path is a sequence of path segments"""
@@ -3149,6 +3181,14 @@ class Path(MutableSequence):
                 if seg_global_max[0] > global_max[0]:
                     global_max = seg_global_max + (seg_idx,)
             return global_min, global_max
+
+    def distance(self, other, tol=1e-9):
+        """Minimum distance from this path to another path or segment.
+
+        See :func:`svgpathtools.distance` for the return type and the
+        meaning of ``tol``."""
+        from .distance import distance as _distance
+        return _distance(self, other, tol=tol)
 
     def rotated(self, degs, origin=None):
         """Returns a copy of self rotated by `degs` degrees (CCW) around the
