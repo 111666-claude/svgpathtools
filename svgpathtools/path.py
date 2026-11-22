@@ -3062,6 +3062,37 @@ class Path(MutableSequence):
                                  ind not in indices2remove]
         return intersection_list
 
+    def intersect_classified(self, other_curve, tol=1e-9, tangency_tol=1e-6):
+        """Finds intersections of `self` with `other_curve` and classifies
+        each contact geometrically.
+
+        Unlike `intersect`, this distinguishes contacts where the two paths
+        actually pass through each other (`CROSSING`) from contacts where
+        they merely touch (`TANGENT`), contacts at path endpoints
+        (`ENDPOINT`), and intervals over which the paths overlap
+        (`COINCIDENT`).  It also handles degenerate (zero-length) segments
+        and fully coincident paths deterministically, and merges duplicate
+        contacts occurring at joints shared by adjacent segments.
+
+        Args:
+            other_curve: the path or path segment to check for intersections
+                with `self`
+            tol (float): geometric tolerance used for coincidence detection,
+                duplicate merging and degenerate-segment detection.
+            tangency_tol (float): near-tangent error threshold; contacts
+                whose tangent directions differ by less than this (in
+                |sin(angle)|) are classified `TANGENT` rather than
+                `CROSSING`.
+
+        Returns:
+            (IntersectionReport): see `svgpathtools.intersections`.  The
+            classic `intersect` output format is available via the report's
+            `.legacy()` method.
+        """
+        from .intersections import classify_intersections
+        return classify_intersections(self, other_curve, tol=tol,
+                                      tangency_tol=tangency_tol)
+
     def bbox(self):
         """returns bounding box in the form (xmin, xmax, ymin, ymax)."""
         bbs = [seg.bbox() for seg in self._segments]
