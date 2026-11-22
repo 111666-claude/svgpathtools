@@ -4,7 +4,11 @@ Arc."""
 
 # External dependencies
 from __future__ import annotations
+import copy
 import re
+import weakref
+from array import array
+from bisect import bisect_left
 try:
     from collections.abc import MutableSequence  # noqa
 except ImportError:
@@ -14,6 +18,53 @@ from operator import itemgetter
 import numpy as np
 from itertools import tee
 from functools import reduce
+
+
+# Arc-length index invalidation support #######################################
+#
+# A Path caches each segment's length and a compact array of cumulative
+# (normalized) segment lengths so Path.point(T) / Path.T2t(T) can locate the
+# segment containing T with a binary search instead of scanning every segment.
+#
+# Structural changes (insert/delete/replace) invalidate the cache through the
+# Path mutator methods.  A segment's *control points* can also be changed in
+# place (e.g. ``path[0].start = z``), so each segment carries a geometry
+# version that is bumped whenever a geometry-defining attribute is assigned.
+# Paths subscribe to their segments through a module-level registry of weak
+# references; an in-place geometry change then invalidates every affected
+# Path's cache immediately, without the Path holding the segment alive and
+# without any per-query scan.
+
+# id(segment) -> set of weakref(Path) instances using that segment.
+# A plain dict keyed by id (segments are not reliably hashable after mutation)
+# with a finalizer that removes dead entries, keeping the registry bounded.
+_geom_listeners: dict = {}
+
+
+def _register_geom_listener(segment, path) -> None:
+    """Subscribe ``path`` to geometry-change notifications from ``segment``."""
+    key = id(segment)
+    listeners = _geom_listeners.get(key)
+    if listeners is None:
+        listeners = set()
+        _geom_listeners[key] = listeners
+
+        def _drop(_ref, _key=key):
+            _geom_listeners.pop(_key, None)
+
+        weakref.finalize(segment, _drop, None)
+    listeners.add(weakref.ref(path))
+
+
+def _bump_geom_version(segment) -> None:
+    """Bump a segment's geometry version and invalidate every Path that
+    currently uses it in a cached arc-length index."""
+    object.__setattr__(segment, '_geom_version',
+                       getattr(segment, '_geom_version', 0) + 1)
+    for ref in _geom_listeners.get(id(segment), ()):
+        path = ref()
+        if path is not None:
+            path._invalidate_length_index()
 
 # these imports were originally from math and cmath, now are from numpy
 # in order to encourage code that generalizes to vector inputs
@@ -632,9 +683,18 @@ def crop_bezier(seg, t0, t1):
 
 
 class Line(object):
+    # Attributes that determine the segment's geometry (and therefore its
+    # length).  Assigning any of them bumps the geometry version.
+    _geom_attrs = frozenset(('start', 'end'))
+
     def __init__(self, start, end):
         self.start = start
         self.end = end
+
+    def __setattr__(self, name, value):
+        object.__setattr__(self, name, value)
+        if name in self._geom_attrs:
+            _bump_geom_version(self)
 
     def __hash__(self) -> int:
         return hash((self.start, self.end))
@@ -900,6 +960,10 @@ class QuadraticBezier(object):
     # For compatibility with old pickle files.
     _length_info = {'length': None, 'bpoints': None}
 
+    # Attributes that determine the segment's geometry (and therefore its
+    # length).  Assigning any of them bumps the geometry version.
+    _geom_attrs = frozenset(('start', 'control', 'end'))
+
     def __init__(self, start, control, end):
         self.start = start
         self.end = end
@@ -907,6 +971,11 @@ class QuadraticBezier(object):
 
         # used to know if self._length needs to be updated
         self._length_info = {'length': None, 'bpoints': None}
+
+    def __setattr__(self, name, value):
+        object.__setattr__(self, name, value)
+        if name in self._geom_attrs:
+            _bump_geom_version(self)
 
     def __hash__(self) -> int:
         return hash((self.start, self.control, self.end))
@@ -1179,6 +1248,15 @@ class CubicBezier(object):
         # used to know if self._length needs to be updated
         self._length_info = {'length': None, 'bpoints': None, 'error': None,
                              'min_depth': None}
+
+    # Attributes that determine the segment's geometry (and therefore its
+    # length).  Assigning any of them bumps the geometry version.
+    _geom_attrs = frozenset(('start', 'control1', 'control2', 'end'))
+
+    def __setattr__(self, name, value):
+        object.__setattr__(self, name, value)
+        if name in self._geom_attrs:
+            _bump_geom_version(self)
 
     def __hash__(self) -> int:
         return hash((self.start, self.control1, self.control2, self.end))
@@ -1527,6 +1605,18 @@ class Arc(object):
 
         # Derive derived parameters
         self._parameterize()
+
+    # Attributes that determine the segment's geometry (and therefore its
+    # length); see apoints().  Assigning any of them bumps the geometry
+    # version.  Derived attributes (e.g. center, phi) and length caches are
+    # excluded.
+    _geom_attrs = frozenset(('start', 'radius', 'rotation', 'large_arc',
+                             'sweep', 'end'))
+
+    def __setattr__(self, name, value):
+        object.__setattr__(self, name, value)
+        if name in self._geom_attrs:
+            _bump_geom_version(self)
 
     def apoints(self) -> tuple[complex, complex, float, bool, bool, complex]:
         """Analog of the Bezier path method, .bpoints(), for Arc objects."""
@@ -2507,6 +2597,15 @@ class Path(MutableSequence):
     def __init__(self, *segments, **kw):
         self._length = None
         self._lengths = None
+        # Fast arc-length location index: _cum_lengths is a compact array of
+        # cumulative normalized segment lengths, built with the same
+        # sequential additions the old point() used (bit-identical rounding),
+        # so Path.point(T) / Path.T2t(T) locate the segment containing T with
+        # a binary search instead of scanning every segment.  It is None until
+        # the first call needing arc-length data, and is invalidated
+        # immediately by the structural mutators and by segment geometry
+        # changes (see _register_geom_listener), so queries never scan.
+        self._cum_lengths = None
         if 'closed' in kw:
             self.closed = kw['closed']  # DEPRECATED
         if len(segments) >= 1:
@@ -2533,6 +2632,36 @@ class Path(MutableSequence):
         if 'tree_element' in kw:
             self._tree_element = kw['tree_element']
 
+    def _invalidate_length_index(self):
+        """Drop the cached arc-length data and location index.
+
+        Called both by the structural mutators and (via the segment geometry
+        listeners) when a segment's control points are changed in place."""
+        self._length = None
+        self._lengths = None
+        self._cum_lengths = None
+
+    def __getstate__(self):
+        # The listener registry holds runtime weak references and is never
+        # part of a path's state; only the instance dict is serialized.
+        return self.__dict__.copy()
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # The restored segments are new objects that have no listener
+        # registration for this path, so any carried-over arc-length cache
+        # could go stale on an in-place segment edit.  Drop it: the index is
+        # rebuilt (and listeners re-registered) lazily on the next query.
+        self._invalidate_length_index()
+
+    def __deepcopy__(self, memo):
+        new = self.__class__.__new__(self.__class__)
+        memo[id(self)] = new
+        new.__dict__ = copy.deepcopy(self.__dict__, memo)
+        # See __setstate__: bind the freshly copied segments on next use.
+        new._invalidate_length_index()
+        return new
+
     def __hash__(self) -> int:
 
         def _pointify(segment):
@@ -2546,13 +2675,13 @@ class Path(MutableSequence):
 
     def __setitem__(self, index, value):
         self._segments[index] = value
-        self._length = None
+        self._invalidate_length_index()
         self._start = self._segments[0].start
         self._end = self._segments[-1].end
 
     def __delitem__(self, index):
         del self._segments[index]
-        self._length = None
+        self._invalidate_length_index()
         if len(self._segments) > 0:
             self._start = self._segments[0].start
             self._end = self._segments[-1].end
@@ -2568,7 +2697,7 @@ class Path(MutableSequence):
 
     def insert(self, index, value):
         self._segments.insert(index, value)
-        self._length = None
+        self._invalidate_length_index()
         self._start = self._segments[0].start
         self._end = self._segments[-1].end
 
@@ -2601,7 +2730,7 @@ class Path(MutableSequence):
         return not self == other
 
     def _calc_lengths(self, error=LENGTH_ERROR, min_depth=LENGTH_MIN_DEPTH):
-        if self._length is not None:
+        if self._length is not None and self._cum_lengths is not None:
             return
 
         lengths = [each.length(error=error, min_depth=min_depth) for each in
@@ -2611,6 +2740,33 @@ class Path(MutableSequence):
             self._lengths = lengths  # all lengths are 0.
         else:
             self._lengths = [each / self._length for each in lengths]
+
+        # Build the fast location index.  The cumulative ends are produced
+        # with the exact sequential additions the previous implementation
+        # performed inside point()/T2t(), so boundary selection and floating
+        # point rounding are unchanged.  A compact C array keeps the extra
+        # footprint bounded at 8 bytes per segment regardless of n.
+        cumulative = array('d')
+        running = 0
+        for seg_length in self._lengths:
+            running = running + seg_length
+            cumulative.append(running)
+        self._cum_lengths = cumulative
+        for seg in self._segments:
+            _register_geom_listener(seg, self)
+
+    def _ensure_length_index(self, error=LENGTH_ERROR,
+                             min_depth=LENGTH_MIN_DEPTH):
+        """Make sure the cached arc-length data and location index reflect the
+        current segments before a query.
+
+        Structural changes and in-place segment geometry changes both clear
+        the cache immediately (the latter via the segment geometry
+        listeners), so no per-query validation is needed: a warm cache is
+        always current.  Objects restored from pickles written before the
+        index existed may have _length set but no index and are rebuilt
+        transparently here."""
+        self._calc_lengths(error=error, min_depth=min_depth)
 
     def point(self, pos):
 
@@ -2622,21 +2778,22 @@ class Path(MutableSequence):
         if pos == 1.0:
             return self._segments[-1].point(pos)
 
-        self._calc_lengths()
-        # Find which segment the point we search for is located on:
-        segment_start = 0
-        for index, segment in enumerate(self._segments):
-            segment_end = segment_start + self._lengths[index]
-            if segment_end >= pos:
-                # This is the segment! How far in on the segment is the point?
-                segment_pos = (pos - segment_start)/(
-                    segment_end - segment_start)
-                return segment.point(segment_pos)
-            segment_start = segment_end
-        raise RuntimeError("Something has gone wrong.  Could not compute Path.point({}) for path {}".format(pos, self))
+        self._ensure_length_index()
+        # Locate the segment containing pos with a binary search over the
+        # cumulative normalized segment lengths.  bisect_left reproduces the
+        # old first-segment-whose-end-`>= pos` selection exactly, including
+        # at segment boundaries and on zero-length segments.
+        index = bisect_left(self._cum_lengths, pos)
+        if index >= len(self._segments):
+            # Matches the previous behavior: no segment reaches pos.
+            raise RuntimeError("Something has gone wrong.  Could not compute Path.point({}) for path {}".format(pos, self))
+        segment_start = self._cum_lengths[index - 1] if index else 0
+        segment_end = self._cum_lengths[index]
+        segment_pos = (pos - segment_start)/(segment_end - segment_start)
+        return self._segments[index].point(segment_pos)
 
     def length(self, T0=0, T1=1, error=LENGTH_ERROR, min_depth=LENGTH_MIN_DEPTH):
-        self._calc_lengths(error=error, min_depth=min_depth)
+        self._ensure_length_index(error=error, min_depth=min_depth)
         if T0 == 0 and T1 == 1:
             return self._length
         else:
@@ -2867,19 +3024,18 @@ class Path(MutableSequence):
             return len(self)-1, 1
         if T == 0:
             return 0, 0
-        self._calc_lengths()
-        # Find which segment self.point(T) falls on:
-        T0 = 0  # the T-value the current segment starts on
-        for seg_idx, seg_length in enumerate(self._lengths):
-            T1 = T0 + seg_length  # the T-value the current segment ends on
-            if T1 >= T:
-                # This is the segment!
-                t = (T - T0)/seg_length
-                return seg_idx, t
-            T0 = T1
-
-        assert 0 <= T <= 1
-        raise BugException
+        self._ensure_length_index()
+        # Locate the segment self.point(T) falls on via binary search over
+        # the cumulative normalized segment lengths.  bisect_left reproduces
+        # the old first-segment-whose-end-`>= T` selection exactly.
+        seg_idx = bisect_left(self._cum_lengths, T)
+        if seg_idx >= len(self):
+            assert 0 <= T <= 1
+            raise BugException
+        seg_length = self._lengths[seg_idx]
+        T0 = self._cum_lengths[seg_idx - 1] if seg_idx else 0
+        t = (T - T0)/seg_length
+        return seg_idx, t
 
     def t2T(self, seg, t):
         """returns the path parameter T which corresponds to the segment
@@ -2889,7 +3045,7 @@ class Path(MutableSequence):
         0 <= t <= 1.
         Input Note: seg can be a segment in the Path object or its
         corresponding index."""
-        self._calc_lengths()
+        self._ensure_length_index()
         # Accept an index or a segment for seg
         if isinstance(seg, int):
             seg_idx = seg
