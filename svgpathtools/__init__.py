@@ -14,6 +14,8 @@ from .misctools import hex2rgb, rgb2hex
 from .smoothing import smoothed_path, smoothed_joint, is_differentiable, kinks
 from .document import (Document, CONVERSIONS, CONVERT_ONLY_PATHS,
                        SVG_GROUP_TAG, SVG_NAMESPACE)
+from .svg_style import (PRESENTATION_ATTRIBUTES, DEFAULT_STYLE,
+                        parse_style_attribute, compute_effective_style)
 from .svg_io_sax import SaxDocument
 
 try:

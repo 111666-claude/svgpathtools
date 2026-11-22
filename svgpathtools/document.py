@@ -53,6 +53,8 @@ from .svg_to_paths import (path2pathd, ellipse2pathd, line2pathd,
                            polyline2pathd, polygon2pathd, rect2pathd)
 from .misctools import open_in_browser
 from .path import transform, Path, is_path_segment
+from .svg_style import (DEFAULT_STYLE, element_declarations,
+                        merge_styles)
 
 # To maintain forward/backward compatibility
 try:
@@ -84,7 +86,7 @@ SVG_GROUP_TAG = 'svg:g'
 
 def flattened_paths(group, group_filter=lambda x: True,
                     path_filter=lambda x: True, path_conversions=CONVERSIONS,
-                    group_search_xpath=SVG_GROUP_TAG):
+                    group_search_xpath=SVG_GROUP_TAG, include_styles=False):
     """Returns the paths inside a group (recursively), expressing the
     paths in the base coordinates.
 
@@ -102,6 +104,15 @@ def flattened_paths(group, group_filter=lambda x: True,
             dictionary will be ignored (including the `path` tag). To
             only convert explicit path elements, pass in
             `path_conversions=CONVERT_ONLY_PATHS`.
+        include_styles (bool):
+            If True, each returned path gets an `effective_style`
+            attribute: a dict with keys 'fill', 'stroke',
+            'stroke-width', 'visibility', 'display' and 'opacity',
+            computed by cascading the presentation attributes and
+            inline `style` declarations of the path element and all of
+            its ancestor groups (see the svg_style module for the exact
+            inheritance, override and display:none rules).  The SVG
+            tree and the geometric results are not modified.
     """
     if not isinstance(group, Element):
         raise TypeError('Must provide an xml.etree.Element object. '
@@ -115,24 +126,31 @@ def flattened_paths(group, group_filter=lambda x: True,
 
     # To handle the transforms efficiently, we'll traverse the tree of
     # groups depth-first using a stack of tuples.
-    # The first entry in the tuple is a group element and the second
-    # entry is its transform. As we pop each entry in the stack, we
-    # will add all its child group elements to the stack.
+    # The first entry in the tuple is a group element, the second
+    # entry is its transform, and the third is the group's effective
+    # style (the cascade of its ancestors' and its own presentation
+    # attributes). As we pop each entry in the stack, we will add all
+    # its child group elements to the stack.
     StackElement = collections.namedtuple('StackElement',
-                                          ['group', 'transform'])
+                                          ['group', 'transform', 'style'])
 
-    def new_stack_element(element, last_tf):
+    def new_stack_element(element, last_tf, parent_style):
+        if include_styles:
+            style = merge_styles(parent_style,
+                                 element_declarations(element))
+        else:
+            style = None
         return StackElement(element, last_tf.dot(
-            parse_transform(element.get('transform'))))
+            parse_transform(element.get('transform'))), style)
 
-    def get_relevant_children(parent, last_tf):
+    def get_relevant_children(parent, last_tf, parent_style):
         children = []
         for elem in filter(group_filter,
                            parent.iterfind(group_search_xpath, SVG_NAMESPACE)):
-            children.append(new_stack_element(elem, last_tf))
+            children.append(new_stack_element(elem, last_tf, parent_style))
         return children
 
-    stack = [new_stack_element(group, np.identity(3))]
+    stack = [new_stack_element(group, np.identity(3), dict(DEFAULT_STYLE))]
 
     paths = []
     while stack:
@@ -149,9 +167,13 @@ def flattened_paths(group, group_filter=lambda x: True,
                 path = transform(parse_path(converter(path_elem)), path_tf)
                 path.element = path_elem
                 path.transform = path_tf
+                if include_styles:
+                    path.effective_style = merge_styles(
+                        top.style, element_declarations(path_elem))
                 paths.append(path)
 
-        stack.extend(get_relevant_children(top.group, top.transform))
+        stack.extend(get_relevant_children(top.group, top.transform,
+                                           top.style))
 
     return paths
 
@@ -160,12 +182,18 @@ def flattened_paths_from_group(group_to_flatten, root, recursive=True,
                                group_filter=lambda x: True,
                                path_filter=lambda x: True,
                                path_conversions=CONVERSIONS,
-                               group_search_xpath=SVG_GROUP_TAG):
+                               group_search_xpath=SVG_GROUP_TAG,
+                               include_styles=False):
     """Flatten all the paths in a specific group.
 
     The paths will be flattened into the 'root' frame. Note that root
     needs to be an ancestor of the group that is being flattened.
-    Otherwise, no paths will be returned."""
+    Otherwise, no paths will be returned.
+
+    If include_styles is True, each returned path gets an
+    `effective_style` attribute (see flattened_paths); the cascade
+    includes the ancestors between root and the group, since traversal
+    starts at root."""
 
     if not any(group_to_flatten is descendant for descendant in root.iter()):
         warnings.warn('The requested group_to_flatten is not a '
@@ -226,7 +254,8 @@ def flattened_paths_from_group(group_to_flatten, root, recursive=True,
         return (id(x) not in ignore_paths) and path_filter(x)
 
     return flattened_paths(root, desired_group_filter, desired_path_filter,
-                           path_conversions, group_search_xpath)
+                           path_conversions, group_search_xpath,
+                           include_styles)
 
 
 class Document:
@@ -267,17 +296,28 @@ class Document:
         return Document(svg_file_obj)
 
     def paths(self, group_filter=lambda x: True,
-              path_filter=lambda x: True, path_conversions=CONVERSIONS):
+              path_filter=lambda x: True, path_conversions=CONVERSIONS,
+              include_styles=False):
         """Returns a list of all paths in the document.
 
         Note that any transform attributes are applied before returning
         the paths.
+
+        If include_styles is True, each returned path also gets an
+        `effective_style` attribute: a dict with the keys 'fill',
+        'stroke', 'stroke-width', 'visibility', 'display' and
+        'opacity', computed by cascading the presentation attributes
+        and inline `style` declarations of the path and its ancestor
+        groups (see the svg_style module for the exact rules).  The
+        document tree is never modified.
         """
         return flattened_paths(self.tree.getroot(), group_filter,
-                               path_filter, path_conversions)
+                               path_filter, path_conversions,
+                               include_styles=include_styles)
 
     def paths_from_group(self, group, recursive=True, group_filter=lambda x: True,
-                         path_filter=lambda x: True, path_conversions=CONVERSIONS):
+                         path_filter=lambda x: True, path_conversions=CONVERSIONS,
+                         include_styles=False):
         if all(isinstance(s, string) for s in group):
             # If we're given a list of strings, assume it represents a
             # nested sequence
@@ -293,7 +333,8 @@ class Document:
             return []
 
         return flattened_paths_from_group(group, self.tree.getroot(), recursive,
-                                          group_filter, path_filter, path_conversions)
+                                          group_filter, path_filter, path_conversions,
+                                          include_styles=include_styles)
 
     def add_path(self, path, attribs=None, group=None):
         """Add a new path to the SVG."""
