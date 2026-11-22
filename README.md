@@ -23,6 +23,8 @@ Some included tools:
 - break discontinuous paths into their **continuous subpaths**.
 - efficiently compute **intersections** between paths and/or segments
 - find a **bounding box** for a path or segment
+- query the **grid cells actually intersected by a path's center line**
+  (analytic grid coverage, not a rasterization of the bounding box)
 - **reverse** segment/path orientation
 - **crop** and **split** paths and segments
 - **smooth** paths (i.e. smooth away kinks to make paths differentiable)
@@ -211,6 +213,49 @@ wsvg(paths, attributes=attributes, svg_attributes=svg_attributes, filename='outp
 ![output1.svg](output1.svg)
 
 There will be many more examples of writing and displaying path data below.
+
+### Grid coverage (which tiles does a path actually touch?)
+
+When a long curving feature (for example a river) is loaded in tiled chunks,
+its overall bounding box can span hundreds of tiles that contain no part of
+the feature at all.  The **grid_coverage()** function returns only the grid
+cells actually intersected by the path's stroke *center line*, together with
+the index of the path segment that intersects each one.  It works
+analytically -- crossing parameters of grid lines are solved for directly, so
+the cost is proportional to the number of occupied cells, not the number
+covered by the bounding box, and no whole-image rasterization is performed.
+
+```python
+from svgpathtools import Path, Line, grid_coverage
+
+# A diagonal line across a unit grid.
+path = Path(Line(0+0j, 3+3j))
+cells = grid_coverage(path)                       # origin 0, 1x1 cells
+# [GridCell(i=0, j=0, segments=(0,)),
+#  GridCell(i=1, j=1, segments=(0,)),
+#  GridCell(i=2, j=2, segments=(0,)),
+#  GridCell(i=3, j=3, segments=(0,))]
+
+# Custom origin, rectangular cells, tolerance and an output cap.
+cells = grid_coverage(path,
+                      origin=-10-10j,             # lower-left corner of (0,0)
+                      cell_size=2.0+0.5j,        # cell width + height
+                      tol=1e-8,                  # boundary snap tolerance
+                      max_cells=10000)           # raises GridCoverageLimit
+for cell in cells:
+    i, j = cell.i, cell.j        # integer grid coordinates
+    segment_ids = cell.segments  # segments whose center line enters it
+```
+
+A :class:`GridCell` compares equal to the plain coordinate tuple
+(``cell == (i, j)``) and also exposes the segment indices as ``cell[2]``.
+
+Cells are half-open: cell `(i, j)` covers
+`origin_x + i*cell_w <= x < origin_x + (i+1)*cell_w` and likewise for `y`, so
+a stroke running along a grid line has one deterministic owner and negative
+cell coordinates are supported.  Zero-sized cells, non-finite coordinates and
+curves that would exceed `max_cells` raise a `ValueError` or
+`GridCoverageLimit` rather than producing partial output.
 
 ### The .point() method and transitioning between path and path segment parameterizations
 SVG Path elements and their segments have official parameterizations.
