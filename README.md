@@ -23,6 +23,7 @@ Some included tools:
 - break discontinuous paths into their **continuous subpaths**.
 - efficiently compute **intersections** between paths and/or segments
 - find a **bounding box** for a path or segment
+- find the **minimum-area rotated (oriented) bounding box** of a path or segment, covering the full Line/Bezier/Arc curves rather than only their control points
 - **reverse** segment/path orientation
 - **crop** and **split** paths and segments
 - **smooth** paths (i.e. smooth away kinks to make paths differentiable)

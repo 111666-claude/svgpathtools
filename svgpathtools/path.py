@@ -3072,6 +3072,18 @@ class Path(MutableSequence):
         ymax = max(ymaxs)
         return xmin, xmax, ymin, ymax
 
+    def min_area_rotated_bbox(self, tol=1e-8):
+        """Returns the minimum-area rotated (oriented) bounding box of
+        this path as a
+        :class:`~svgpathtools.rotated_bbox.RotatedBoundingBox`.
+
+        See :func:`svgpathtools.rotated_bbox.min_area_rotated_bbox`
+        for the full semantics, including the geometric tolerance
+        ``tol`` and the handling of empty, point-like and collinear
+        paths."""
+        from .rotated_bbox import min_area_rotated_bbox
+        return min_area_rotated_bbox(self, tol=tol)
+
     def cropped(self, T0, T1):
         """returns a cropped copy of the path."""
         assert 0 <= T0 <= 1 and 0 <= T1<= 1
