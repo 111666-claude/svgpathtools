@@ -108,6 +108,52 @@ print(parse_path(path.d()) == path)
     True
 
 
+### Canonical d-strings (stable content keys)
+
+The same icon exported by different editors often produces different
+d-strings for the same geometry: relative vs. absolute commands, `H`/`V`/
+`S`/`T` shorthands, different decimal places, scientific notation or
+negative zero.  `Path.canonical_d()` (and the module-level
+`canonical_path()` function) return a deterministic d-string suitable as a
+cache key or content hash.
+
+```python
+from svgpathtools import parse_path, canonical_path
+
+# three equivalent spellings of one triangle
+variants = [
+    'M 10,10 L 40,10 L 25,35 Z',
+    'm10 10 h30 l-15 25 L10 10',
+    'M10.0000001,10 H40 L25,35 L10,10',
+]
+keys = {canonical_path(parse_path(d)) for d in variants}
+len(keys)  # 1
+```
+
+The canonical spelling only uses absolute `M`/`L`/`Q`/`C`/`A` commands,
+fixed-point numbers (no scientific notation, no negative zero) and explicit
+subpath movetos; `H`/`V`/`S`/`T` are expanded and `Z` is written as the
+explicit closing line.  Numbers are quantized to a configurable geometric
+error bound (`error=1e-6` by default): every emitted coordinate stays within
+that bound of the input, so shapes farther apart than `error` never collide
+on the same key, and applying `canonical_d()` again to the re-parsed output
+is a byte-identical no-op.
+
+```python
+path = parse_path('M10.5,20.25 h30 V60 Z')
+print(path.canonical_d(error=1e-3))
+# M 10.5,20.25 L 40.5,20.25 L 40.5,60 L 10.5,20.25
+print(parse_path(path.canonical_d()).canonical_d() == path.canonical_d())
+# True
+```
+
+Arcs whose quantization would be degenerate or exceed the bound are
+automatically rendered at higher precision; segments that cannot be
+represented as valid fixed-point SVG (non-finite coordinates, or an Arc
+whose endpoints would coincide at the numeric limit) raise `ValueError`
+rather than producing an ambiguous key.
+
+
 The ``Path`` class is a mutable sequence, so it behaves much like a list.
 So segments can **append**ed, **insert**ed, set by index, **del**eted, **enumerate**d, **slice**d out, etc.
 

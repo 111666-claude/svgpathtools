@@ -2809,9 +2809,27 @@ class Path(MutableSequence):
     
         if self_closed:
             parts.append('Z')
-    
+
         s = ' '.join(parts)
         return s if not rel else s.lower()
+
+    def canonical_d(self, error=1e-6, max_refine_steps=6):
+        """Return a deterministic, re-parseable canonical d-string.
+
+        Equivalent spellings of the same geometry (relative/absolute
+        commands, ``H``/``V``/``S``/``T`` shorthands, differing decimal
+        places, scientific notation, negative zero) produce the identical
+        string, which makes the output suitable as a cache key or content
+        hash.  The output only uses absolute ``M``/``L``/``Q``/``C``/``A``
+        commands and fixed-point numbers; applying ``canonical_d`` again to
+        the re-parsed output is a byte-identical no-op.
+
+        See :func:`svgpathtools.canonical.canonical_path` for the full
+        description of the parameters and the error-bound guarantees."""
+        # Local import to avoid a circular import at module load time.
+        from .canonical import canonical_path
+        return canonical_path(self, error=error,
+                              max_refine_steps=max_refine_steps)
 
     def joins_smoothly_with(self, previous, wrt_parameterization=False):
         """Checks if this Path object joins smoothly with previous
