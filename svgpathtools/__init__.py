@@ -2,6 +2,8 @@ from .bezier import (bezier_point, bezier2polynomial,
                      polynomial2bezier, split_bezier,
                      bezier_bounding_box, bezier_intersections,
                      bezier_by_line_intersections)
+from .spatial_index import (SegmentSpatialIndex, segment_candidate_pairs,
+                            MAX_GRID_OCCUPANCY, GRID_MEMBERSHIP_FACTOR)
 from .path import (Path, Line, QuadraticBezier, CubicBezier, Arc,
                    bezier_segment, is_bezier_segment, is_path_segment,
                    is_bezier_path, concatpaths, poly2bez, bpoints2bezier,

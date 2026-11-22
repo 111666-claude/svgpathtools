@@ -33,6 +33,7 @@ from .bezier import (bezier_intersections, bezier_bounding_box, split_bezier,
                      bezier2polynomial)
 from .misctools import BugException
 from .polytools import rational_limit, polyroots, polyroots01, imag, real
+from .spatial_index import SegmentSpatialIndex
 
 # To maintain forward/backward compatibility
 try:
@@ -2503,10 +2504,13 @@ class Path(MutableSequence):
     element = None
     transform = None
     meta = None  # meant as container for storage of arbitrary meta data
+    # Cached conservative spatial index (None when stale or unbuilt).
+    _spatial_index = None
 
     def __init__(self, *segments, **kw):
         self._length = None
         self._lengths = None
+        self._spatial_index = None
         if 'closed' in kw:
             self.closed = kw['closed']  # DEPRECATED
         if len(segments) >= 1:
@@ -2547,12 +2551,14 @@ class Path(MutableSequence):
     def __setitem__(self, index, value):
         self._segments[index] = value
         self._length = None
+        self._spatial_index = None
         self._start = self._segments[0].start
         self._end = self._segments[-1].end
 
     def __delitem__(self, index):
         del self._segments[index]
         self._length = None
+        self._spatial_index = None
         if len(self._segments) > 0:
             self._start = self._segments[0].start
             self._end = self._segments[-1].end
@@ -2569,6 +2575,7 @@ class Path(MutableSequence):
     def insert(self, index, value):
         self._segments.insert(index, value)
         self._length = None
+        self._spatial_index = None
         self._start = self._segments[0].start
         self._end = self._segments[-1].end
 
@@ -2730,6 +2737,7 @@ class Path(MutableSequence):
         self._start = pt
         if len(self._segments)>0:
             self._segments[0].start = pt
+            self._spatial_index = None
 
     @property
     def end(self):
@@ -2742,6 +2750,7 @@ class Path(MutableSequence):
         self._end = pt
         if len(self._segments)>0:
             self._segments[-1].end = pt
+            self._spatial_index = None
 
     def d(self, useSandT=False, use_closed_attrib=False, rel=False):
         """Returns a path d-string for the path object.
@@ -3008,6 +3017,39 @@ class Path(MutableSequence):
                 bezier_path_approximation.append(seg)
         return area_without_arcs(Path(*bezier_path_approximation))
 
+    def spatial_index(self, tol=1e-12):
+        """Return a cached conservative :class:`SegmentSpatialIndex`.
+
+        The index is built lazily from the padded bounding boxes of the
+        path's segments and reused by later :meth:`intersect` calls until
+        the path is mutated (any insertion, deletion, replacement, or
+        start/end change invalidates it), at which point the next call
+        rebuilds it automatically.
+
+        Args:
+            tol (float): tolerance used to pad the bounding boxes so that
+                tangencies, endpoint and near-boundary contacts cannot be
+                filtered out.
+
+        Returns:
+            SegmentSpatialIndex: an index over this path's segments.  An
+            empty path yields an index in (degenerate) brute-force mode
+            with no entries.
+        """
+        if self._spatial_index is None or self._spatial_index.tol != tol:
+            self._spatial_index = SegmentSpatialIndex(
+                self._segments, tol=tol)
+        return self._spatial_index
+
+    def invalidate_spatial_index(self):
+        """Drop the cached spatial index.
+
+        This is called automatically by every in-place mutating operation,
+        but it is also safe to call manually when a segment object shared
+        with another container has been modified in place.
+        """
+        self._spatial_index = None
+
     def intersect(self, other_curve, justonemode=False, tol=1e-12):
         """Finds intersections of `self` with `other_curve`
 
@@ -3027,20 +3069,37 @@ class Path(MutableSequence):
         Scope:
             If the two path objects coincide for more than a finite set of
             points, this code will iterate to max depth and/or raise an error.
+
+        Implementation:
+            A conservative uniform-grid spatial index over the (padded)
+            segment bounding boxes screens out segment pairs that cannot
+            intersect.  Only candidate pairs reach the original exact
+            per-segment intersection routine, and because the screening is
+            conservative (inclusive, padded boxes), no tangent, endpoint,
+            near-boundary or Arc intersection can be dropped.  Candidate
+            pairs are processed in ascending (seg1, seg2) index order, so
+            the returned list -- including the chosen entry in
+            `justonemode` -- is identical to a brute-force run.
         """
         path1 = self
         path2 = other_curve if isinstance(other_curve, Path) else Path(other_curve)
         assert path1 != path2
 
+        # Conservative candidate screening via reusable spatial indices.
+        index1 = path1.spatial_index(tol=tol)
+        index2 = path2.spatial_index(tol=tol)
+        candidate_pairs = index1.candidate_pairs(index2)
+
         intersection_list = []
-        for seg1 in path1:
-            for seg2 in path2:
-                if justonemode and intersection_list:
-                    return intersection_list[0]
-                for t1, t2 in seg1.intersect(seg2, tol=tol):
-                    T1 = path1.t2T(seg1, t1)
-                    T2 = path2.t2T(seg2, t2)
-                    intersection_list.append(((T1, seg1, t1), (T2, seg2, t2)))
+        for i, j in candidate_pairs:
+            if justonemode and intersection_list:
+                return intersection_list[0]
+            seg1 = path1[i]
+            seg2 = path2[j]
+            for t1, t2 in seg1.intersect(seg2, tol=tol):
+                T1 = path1.t2T(seg1, t1)
+                T2 = path2.t2T(seg2, t2)
+                intersection_list.append(((T1, seg1, t1), (T2, seg2, t2)))
 
         if justonemode and intersection_list:
             return intersection_list[0]
