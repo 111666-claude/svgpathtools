@@ -82,9 +82,31 @@ CONVERT_ONLY_PATHS = {'path': path2pathd}
 SVG_GROUP_TAG = 'svg:g'
 
 
+def _element_location(elem, budget=None):
+    """Best-effort source position for an ElementTree element."""
+    line = getattr(elem, 'sourceline', None)
+    if not line and budget is not None:
+        line = getattr(budget, 'source_lines', {}).get(id(elem))
+    if line:
+        return 'line {0}'.format(line)
+    return 'unknown location'
+
+
+def _account_path(path_d, budget, location, element_tag):
+    """Charge one converted shape's commands/segments to the budget.
+
+    Runs the linear, incremental :func:`_count_path` accounting *before* any
+    segment object is built, so an oversized path is rejected while only the
+    leading portion of its ``d`` string has been scanned.
+    """
+    from .limits import _count_path
+    _count_path(path_d, budget=budget, location=location,
+                element=element_tag)
+
+
 def flattened_paths(group, group_filter=lambda x: True,
                     path_filter=lambda x: True, path_conversions=CONVERSIONS,
-                    group_search_xpath=SVG_GROUP_TAG):
+                    group_search_xpath=SVG_GROUP_TAG, budget=None):
     """Returns the paths inside a group (recursively), expressing the
     paths in the base coordinates.
 
@@ -102,6 +124,8 @@ def flattened_paths(group, group_filter=lambda x: True,
             dictionary will be ignored (including the `path` tag). To
             only convert explicit path elements, pass in
             `path_conversions=CONVERT_ONLY_PATHS`.
+        budget (ImportBudget or None): optional resource budget. Its
+            total-segment counter is advanced as each path is parsed.
     """
     if not isinstance(group, Element):
         raise TypeError('Must provide an xml.etree.Element object. '
@@ -146,7 +170,22 @@ def flattened_paths(group, group_filter=lambda x: True,
                     'svg:'+key, SVG_NAMESPACE)):
                 path_tf = top.transform.dot(
                     parse_transform(path_elem.get('transform')))
-                path = transform(parse_path(converter(path_elem)), path_tf)
+                location = _element_location(path_elem, budget)
+                if budget is not None and key in ('path', 'polyline',
+                                                   'polygon'):
+                    # Enforce limits from the raw attributes, before the
+                    # (potentially huge) shape-to-d conversion runs.
+                    from .limits import account_shape
+                    account_shape(key, path_elem.attrib, budget, location,
+                                  path_elem.tag)
+                path_d = converter(path_elem)
+                if budget is not None and key not in ('path', 'polyline',
+                                                       'polygon'):
+                    _account_path(path_d, budget, location, path_elem.tag)
+                path = transform(
+                    parse_path(path_d, budget=budget, location=location,
+                               count_against_budget=False),
+                    path_tf)
                 path.element = path_elem
                 path.transform = path_tf
                 paths.append(path)
@@ -160,7 +199,8 @@ def flattened_paths_from_group(group_to_flatten, root, recursive=True,
                                group_filter=lambda x: True,
                                path_filter=lambda x: True,
                                path_conversions=CONVERSIONS,
-                               group_search_xpath=SVG_GROUP_TAG):
+                               group_search_xpath=SVG_GROUP_TAG,
+                               budget=None):
     """Flatten all the paths in a specific group.
 
     The paths will be flattened into the 'root' frame. Note that root
@@ -226,24 +266,32 @@ def flattened_paths_from_group(group_to_flatten, root, recursive=True,
         return (id(x) not in ignore_paths) and path_filter(x)
 
     return flattened_paths(root, desired_group_filter, desired_path_filter,
-                           path_conversions, group_search_xpath)
+                           path_conversions, group_search_xpath, budget)
 
 
 class Document:
-    def __init__(self, filepath=None):
+    def __init__(self, filepath=None, budget=None):
         """A container for a DOM-style SVG document.
 
-        The `Document` class provides a simple interface to modify and analyze 
-        the path elements in a DOM-style document.  The DOM-style document is 
+        The `Document` class provides a simple interface to modify and analyze
+        the path elements in a DOM-style document.  The DOM-style document is
         parsed into an ElementTree object (stored in the `tree` attribute).
 
         This class provides functions for extracting SVG data into Path objects.
         The output Path objects will be transformed based on their parent groups.
-        
+
         Args:
             filepath (str or file-like): The filepath of the
                 DOM-style object or a file-like object containing it.
+            budget (ImportBudget or None): optional resource budget. When
+                given, the input is streamed through a hardened expat parser
+                and rejected (with `ImportLimitExceeded`) as soon as any limit
+                is crossed -- bytes, XML depth, element count, per-path
+                command count, or total segments. When ``None`` the historical
+                ElementTree parsing path is used unchanged.
         """
+        self.budget = budget
+        self._source_lines = {}
 
         # strings are interpreted as file location everything else is treated as
         # file-like object and passed to the xml parser directly
@@ -252,19 +300,30 @@ class Document:
 
         if filepath is None:
             self.tree = etree.ElementTree(Element('svg'))
-        else:
-            # parse svg to ElementTree object
+        elif budget is None:
+            # parse svg to ElementTree object (historical behavior)
             self.tree = etree.parse(filepath)
+        else:
+            from .limits import guarded_parse
+            tree, source_lines, reader, opened_here = guarded_parse(
+                filepath, budget)
+            self.tree = tree
+            self._source_lines = source_lines
+            # Expose the line map on the budget so flattened_paths() can
+            # resolve element positions during the (later) paths() call.
+            budget.source_lines = source_lines
+            if opened_here:
+                reader.close()
 
         self.root = self.tree.getroot()
 
     @classmethod
-    def from_svg_string(cls, svg_string):
+    def from_svg_string(cls, svg_string, budget=None):
         """Constructor for creating a Document object from a string."""
         # wrap string into StringIO object
         svg_file_obj = StringIO(svg_string)
         # create document from file object
-        return Document(svg_file_obj)
+        return Document(svg_file_obj, budget=budget)
 
     def paths(self, group_filter=lambda x: True,
               path_filter=lambda x: True, path_conversions=CONVERSIONS):
@@ -274,7 +333,8 @@ class Document:
         the paths.
         """
         return flattened_paths(self.tree.getroot(), group_filter,
-                               path_filter, path_conversions)
+                               path_filter, path_conversions,
+                               budget=self.budget)
 
     def paths_from_group(self, group, recursive=True, group_filter=lambda x: True,
                          path_filter=lambda x: True, path_conversions=CONVERSIONS):
@@ -293,7 +353,8 @@ class Document:
             return []
 
         return flattened_paths_from_group(group, self.tree.getroot(), recursive,
-                                          group_filter, path_filter, path_conversions)
+                                          group_filter, path_filter, path_conversions,
+                                          budget=self.budget)
 
     def add_path(self, path, attribs=None, group=None):
         """Add a new path to the SVG."""

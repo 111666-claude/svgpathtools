@@ -160,6 +160,107 @@ def line2pathd(l):
     )
 
 
+# Element kinds in document order, paired with their conversion flags and
+# converters.  Shared with the budgeted pipeline so both code paths accept or
+# reject the same set of shapes.
+_SHAPE_SPECS = (
+    ('path', None, path2pathd),
+    ('polyline', 'convert_polylines_to_paths', polyline2pathd),
+    ('polygon', 'convert_polygons_to_paths', polygon2pathd),
+    ('line', 'convert_lines_to_paths', None),
+    ('ellipse', 'convert_ellipses_to_paths', ellipse2pathd),
+    ('circle', 'convert_circles_to_paths', ellipse2pathd),
+    ('rect', 'convert_rectangles_to_paths', rect2pathd),
+)
+
+
+def _line2pathd_dict(attrs):
+    """line2pathd for a plain attribute dict (SAX-style)."""
+    return ('M' + attrs.get('x1', '0') + ' ' + attrs.get('y1', '0')
+            + 'L' + attrs.get('x2', '0') + ' ' + attrs.get('y2', '0'))
+
+
+# Local shape name -> d-string converter (line/path handled specially).
+_shape_converters = dict(
+    (name, conv) for name, _, conv in _SHAPE_SPECS if conv is not None)
+
+
+def _svg2paths_budgeted(svg_file_location, return_svg_attributes,
+                        convert_circles_to_paths, convert_ellipses_to_paths,
+                        convert_lines_to_paths, convert_polylines_to_paths,
+                        convert_polygons_to_paths,
+                        convert_rectangles_to_paths, budget):
+    """Budgeted twin of svg2paths(): stream through hardened expat, accounting
+    for every path's commands/segments before constructing Path objects."""
+    from .limits import (guarded_parse, _count_path, account_shape,
+                         _SVG_PREFIX)
+
+    flags = {
+        'convert_circles_to_paths': convert_circles_to_paths,
+        'convert_ellipses_to_paths': convert_ellipses_to_paths,
+        'convert_lines_to_paths': convert_lines_to_paths,
+        'convert_polylines_to_paths': convert_polylines_to_paths,
+        'convert_polygons_to_paths': convert_polygons_to_paths,
+        'convert_rectangles_to_paths': convert_rectangles_to_paths,
+    }
+    enabled = {'path'}
+    for local, flag_name, _ in _SHAPE_SPECS:
+        if flag_name is None or flags.get(flag_name, True):
+            enabled.add(local)
+
+    # minidom's getElementsByTagName returns every element of one tag before
+    # moving to the next tag, so collect each shape kind separately and emit
+    # them in the exact legacy order (paths, polylines, polygons, lines,
+    # ellipses, circles, rects).  Limits are still enforced in document order
+    # inside on_shape, so rejection timing is unchanged.
+    buckets = dict((name, []) for name, _, _ in _SHAPE_SPECS)
+    svg_attrs = {}
+
+    def on_shape(local, attrs, location, bud):
+        if local not in enabled:
+            return
+        element = _SVG_PREFIX + local
+        if local in ('path', 'polyline', 'polygon'):
+            # Pre-account lazily, before any expensive conversion.  These are
+            # the shapes whose raw attributes can themselves be enormous.
+            account_shape(local, attrs, bud, location, element)
+            if local == 'path':
+                path_d = path2pathd(attrs)
+            else:
+                path_d = _shape_converters[local](attrs)
+        else:
+            if local == 'line':
+                path_d = _line2pathd_dict(attrs)
+            else:
+                path_d = _shape_converters[local](attrs)
+            _count_path(path_d, budget=bud, location=location,
+                        element=element)
+        buckets[local].append((dict(attrs), path_d, location))
+
+    tree, _source_lines, reader, opened_here = guarded_parse(
+        svg_file_location, budget, on_shape=on_shape)
+    try:
+        root = tree.getroot()
+        if return_svg_attributes:
+            svg_attrs = dict(root.attrib)
+
+        path_list = []
+        attribute_dictionary_list = []
+        for local, _, _ in _SHAPE_SPECS:
+            for attrs, path_d, location in buckets[local]:
+                attribute_dictionary_list.append(attrs)
+                path_list.append(parse_path(
+                    path_d, budget=budget, location=location,
+                    count_against_budget=False))
+    finally:
+        if opened_here:
+            reader.close()
+
+    if return_svg_attributes:
+        return path_list, attribute_dictionary_list, svg_attrs
+    return path_list, attribute_dictionary_list
+
+
 def svg2paths(svg_file_location,
               return_svg_attributes=False,
               convert_circles_to_paths=True,
@@ -167,8 +268,9 @@ def svg2paths(svg_file_location,
               convert_lines_to_paths=True,
               convert_polylines_to_paths=True,
               convert_polygons_to_paths=True,
-              convert_rectangles_to_paths=True):
-    """Converts an SVG into a list of Path objects and attribute dictionaries. 
+              convert_rectangles_to_paths=True,
+              budget=None):
+    """Converts an SVG into a list of Path objects and attribute dictionaries.
 
     Converts an SVG file into a list of Path objects and a list of
     dictionaries containing their attributes.  This currently supports
@@ -179,13 +281,13 @@ def svg2paths(svg_file_location,
             svg file on disk or a file-like object containing the content of a
             svg file
         return_svg_attributes (bool): Set to True and a dictionary of
-            svg-attributes will be extracted and returned.  See also the 
+            svg-attributes will be extracted and returned.  See also the
             `svg2paths2()` function.
         convert_circles_to_paths: Set to False to exclude SVG-Circle
-            elements (converted to Paths).  By default circles are included as 
+            elements (converted to Paths).  By default circles are included as
             paths of two `Arc` objects.
         convert_ellipses_to_paths (bool): Set to False to exclude SVG-Ellipse
-            elements (converted to Paths).  By default ellipses are included as 
+            elements (converted to Paths).  By default ellipses are included as
             paths of two `Arc` objects.
         convert_lines_to_paths (bool): Set to False to exclude SVG-Line elements
             (converted to Paths)
@@ -195,12 +297,27 @@ def svg2paths(svg_file_location,
             elements (converted to Paths)
         convert_rectangles_to_paths (bool): Set to False to exclude SVG-Rect
             elements (converted to Paths).
+        budget (ImportBudget or None): optional resource budget. When given,
+            the input is streamed through a hardened expat parser (bounded
+            bytes, XML depth, element count, per-path commands and total
+            segments) and `ImportLimitExceeded` is raised on the first breach.
+            The historical minidom parser is used unchanged when ``None``.
+            Note that with a budget, namespaced attribute keys are returned in
+            ElementTree's Clark notation (``'{uri}name'``) rather than the
+            minidom's prefixed form (``'prefix:name'``).
 
-    Returns: 
+    Returns:
         list: The list of Path objects.
         list: The list of corresponding path attribute dictionaries.
         dict (optional): A dictionary of svg-attributes (see `svg2paths2()`).
     """
+    if budget is not None:
+        return _svg2paths_budgeted(
+            svg_file_location, return_svg_attributes,
+            convert_circles_to_paths, convert_ellipses_to_paths,
+            convert_lines_to_paths, convert_polylines_to_paths,
+            convert_polygons_to_paths, convert_rectangles_to_paths, budget)
+
     # strings are interpreted as file location everything else is treated as
     # file-like object and passed to the xml parser directly
     from_filepath = isinstance(svg_file_location, str) or isinstance(svg_file_location, FilePathLike)
@@ -272,7 +389,8 @@ def svg2paths2(svg_file_location,
                convert_lines_to_paths=True,
                convert_polylines_to_paths=True,
                convert_polygons_to_paths=True,
-               convert_rectangles_to_paths=True):
+               convert_rectangles_to_paths=True,
+               budget=None):
     """Convenience function; identical to svg2paths() except that
     return_svg_attributes=True by default.  See svg2paths() docstring for more
     info."""
@@ -283,7 +401,8 @@ def svg2paths2(svg_file_location,
                      convert_lines_to_paths=convert_lines_to_paths,
                      convert_polylines_to_paths=convert_polylines_to_paths,
                      convert_polygons_to_paths=convert_polygons_to_paths,
-                     convert_rectangles_to_paths=convert_rectangles_to_paths)
+                     convert_rectangles_to_paths=convert_rectangles_to_paths,
+                     budget=budget)
 
 
 def svgstr2paths(svg_string,
@@ -293,7 +412,8 @@ def svgstr2paths(svg_string,
                convert_lines_to_paths=True,
                convert_polylines_to_paths=True,
                convert_polygons_to_paths=True,
-               convert_rectangles_to_paths=True):
+               convert_rectangles_to_paths=True,
+               budget=None):
     """Convenience function; identical to svg2paths() except that it takes the
     svg object as string.  See svg2paths() docstring for more
     info."""
@@ -306,4 +426,5 @@ def svgstr2paths(svg_string,
                      convert_lines_to_paths=convert_lines_to_paths,
                      convert_polylines_to_paths=convert_polylines_to_paths,
                      convert_polygons_to_paths=convert_polygons_to_paths,
-                     convert_rectangles_to_paths=convert_rectangles_to_paths)
+                     convert_rectangles_to_paths=convert_rectangles_to_paths,
+                     budget=budget)

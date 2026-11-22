@@ -43,12 +43,41 @@ Some included tools:
 $ pip install svgpathtools
 ```  
   
-### Alternative Setup 
+### Alternative Setup
 You can download the source from Github and install by using the command (from inside the folder containing setup.py):
 
 ```bash
 $ python setup.py install
 ```
+
+## Importing untrusted SVGs (import budgets)
+
+A small SVG can still exhaust memory by combining a very long path `d`
+string, deeply nested groups, or entity expansion.  Every entry point
+accepts an optional `ImportBudget` that bounds the resources a single import
+may consume.  With no budget supplied, behavior is unchanged.
+
+```python
+from svgpathtools import Document, SaxDocument, svg2paths, ImportBudget
+
+budget = ImportBudget(
+    max_bytes=5_000_000,        # raw input bytes
+    max_xml_depth=200,         # element nesting depth (root is depth 1)
+    max_elements=100_000,      # total XML elements
+    max_path_commands=10_000,  # commands in any single path
+    max_total_segments=100_000)  # total Path segments after conversion
+
+Document("drawing.svg", budget=budget).paths()
+SaxDocument("drawing.svg", budget=budget).flatten_all_paths()
+svg2paths("drawing.svg", budget=budget)
+```
+
+Limits are enforced while the document streams through a hardened expat
+parser — paths are never fully built and checked afterwards.  Crossing a
+limit raises `ImportLimitExceeded`, whose message names the limit and carries
+the source location (line/column) and offending element; a custom or external
+XML entity raises `InvalidSvgEntityError`.  A budget is single-use: create one
+per import.  See `svgpathtools.limits` for the full reference.
 
 ## Credit where credit's due
 Much of the core of this module was taken from [the svg.path (v2.0) module](https://github.com/regebro/svg.path).  Interested svg.path users should see the compatibility notes at bottom of this readme.

@@ -11,8 +11,11 @@ import warnings
 from .path import Path
 
 
-def parse_path(pathdef, current_pos=0j, tree_element=None):
-    return Path(pathdef, current_pos=current_pos, tree_element=tree_element)
+def parse_path(pathdef, current_pos=0j, tree_element=None, budget=None,
+               location=None, count_against_budget=True):
+    return Path(pathdef, current_pos=current_pos, tree_element=tree_element,
+                budget=budget, location=location,
+                count_against_budget=count_against_budget)
 
 
 def _check_num_parsed_values(values, allowed):

@@ -2505,6 +2505,16 @@ class Path(MutableSequence):
         self._lengths = None
         if 'closed' in kw:
             self.closed = kw['closed']  # DEPRECATED
+        # Optional import budget (see svgpathtools.limits).  When present, the
+        # running segment total is checked as each segment is appended, so a
+        # path that blows the budget fails early instead of being fully built.
+        # The document-level parsers (Document, SaxDocument, svg2paths) already
+        # account for segments up front via budget.note_path(...), so they set
+        # count_against_budget=False to avoid counting the same segments twice;
+        # a direct parse_path(..., budget=...) call leaves it True.
+        self._budget = kw.get('budget', None)
+        self._budget_location = kw.get('location', None)
+        self._count_against_budget = kw.get('count_against_budget', True)
         if len(segments) >= 1:
             if isinstance(segments[0], str):
                 if len(segments) >= 2:
@@ -2517,6 +2527,7 @@ class Path(MutableSequence):
                 self._parse_path(segments[0], current_pos)
             else:
                 self._segments = list(segments)
+                self._tick_budget(len(self._segments))
         else:
             self._segments = list()
         if self._segments:
@@ -2528,6 +2539,28 @@ class Path(MutableSequence):
 
         if 'tree_element' in kw:
             self._tree_element = kw['tree_element']
+
+    def _tick_budget(self, added=1):
+        """Enforce the optional ImportBudget's total-segment limit.
+
+        Imported lazily to avoid a circular import (limits.py imports from
+        path.py).  The XML-level checks normally reject oversized documents
+        before this point; this hook keeps direct ``parse_path(...,
+        budget=...)`` calls bounded as well.
+        """
+        budget = self._budget
+        if budget is None or not self._count_against_budget:
+            return
+        budget.total_segments += added
+        if (budget.max_total_segments is not None and
+                budget.total_segments > budget.max_total_segments):
+            from .limits import ImportLimitExceeded
+            location = self._budget_location or budget.last_location
+            raise ImportLimitExceeded(
+                'max_total_segments', budget.max_total_segments,
+                budget.total_segments, location,
+                element=budget.last_element,
+                element_index=budget.elements)
 
     def __hash__(self) -> int:
 
@@ -3289,6 +3322,7 @@ class Path(MutableSequence):
                 # Close path
                 if not (current_pos == start_pos):
                     segments.append(Line(current_pos, start_pos))
+                    self._tick_budget()
                 self._closed = True
                 current_pos = start_pos
                 command = None
@@ -3300,6 +3334,7 @@ class Path(MutableSequence):
                 if not absolute:
                     pos += current_pos
                 segments.append(Line(current_pos, pos))
+                self._tick_budget()
                 current_pos = pos
 
             elif command == 'H':
@@ -3308,6 +3343,7 @@ class Path(MutableSequence):
                 if not absolute:
                     pos += current_pos.real
                 segments.append(Line(current_pos, pos))
+                self._tick_budget()
                 current_pos = pos
 
             elif command == 'V':
@@ -3316,6 +3352,7 @@ class Path(MutableSequence):
                 if not absolute:
                     pos += current_pos.imag * 1j
                 segments.append(Line(current_pos, pos))
+                self._tick_budget()
                 current_pos = pos
 
             elif command == 'C':
@@ -3329,6 +3366,7 @@ class Path(MutableSequence):
                     end += current_pos
 
                 segments.append(CubicBezier(current_pos, control1, control2, end))
+                self._tick_budget()
                 current_pos = end
 
             elif command == 'S':
@@ -3354,6 +3392,7 @@ class Path(MutableSequence):
                     end += current_pos
 
                 segments.append(CubicBezier(current_pos, control1, control2, end))
+                self._tick_budget()
                 current_pos = end
 
             elif command == 'Q':
@@ -3365,6 +3404,7 @@ class Path(MutableSequence):
                     end += current_pos
 
                 segments.append(QuadraticBezier(current_pos, control, end))
+                self._tick_budget()
                 current_pos = end
 
             elif command == 'T':
@@ -3388,6 +3428,7 @@ class Path(MutableSequence):
                     end += current_pos
 
                 segments.append(QuadraticBezier(current_pos, control, end))
+                self._tick_budget()
                 current_pos = end
 
             elif command == 'A':
@@ -3415,6 +3456,7 @@ class Path(MutableSequence):
                 else:
                     segments.append(
                         Arc(current_pos, radius, rotation, arc, sweep, end))
+                self._tick_budget()
                 current_pos = end
 
         return segments
